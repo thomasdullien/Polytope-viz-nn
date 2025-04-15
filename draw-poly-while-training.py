@@ -13,6 +13,7 @@ import base64
 import sys
 import argparse
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
 
 ### Neural Network Definition ###
 class ReLUNetwork(nn.Module):
@@ -424,6 +425,90 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         dump_network_weights(network, "weights.txt")
         exit(1)
 
+def generate_kernel_smoothed_image(train_data, image_shape, sigma=3.0):
+    """
+    Generate a kernel-smoothed image from training data points.
+    
+    Args:
+        train_data: Array of (x_norm, y_norm, value) training points
+        image_shape: Tuple of (height, width) for the output image
+        sigma: Standard deviation for Gaussian kernel
+        
+    Returns:
+        Smoothed image as a numpy array
+    """
+    height, width = image_shape
+    # Initialize empty image
+    density = np.zeros((height, width), dtype=np.float32)
+    values = np.zeros((height, width), dtype=np.float32)
+    
+    # Place training points on the grid
+    for x_norm, y_norm, value in train_data:
+        x, y = int(np.round(x_norm * (width-1))), int(np.round(y_norm * (height-1)))
+        if 0 <= x < width and 0 <= y < height:
+            density[y, x] += 1
+            values[y, x] += value
+    
+    # Normalize values where density > 0
+    mask = density > 0
+    values[mask] /= density[mask]
+    
+    # Apply Gaussian smoothing to both density and values
+    smoothed_density = gaussian_filter(density, sigma=sigma)
+    smoothed_values = gaussian_filter(values, sigma=sigma)
+    
+    # Normalize the result where density is significant
+    significant_density = smoothed_density > 0.01 * smoothed_density.max()
+    result = np.zeros_like(smoothed_values)
+    result[significant_density] = smoothed_values[significant_density] / smoothed_density[significant_density]
+    
+    # Normalize to 0-1 range
+    if result.max() > result.min():
+        result = (result - result.min()) / (result.max() - result.min())
+    
+    return result
+
+def save_kernel_smoothed_image(train_data, image_shape, output_path, original_image_path, sigma=3.0):
+    """
+    Generate and save a kernel-smoothed image from training data points.
+    
+    Args:
+        train_data: Array of (x_norm, y_norm, value) training points
+        image_shape: Tuple of (height, width) for the output image
+        output_path: Path to save the output image
+        original_image_path: Path to the original image for comparison
+        sigma: Standard deviation for Gaussian kernel
+    """
+    # Generate the smoothed image
+    smoothed_image = generate_kernel_smoothed_image(train_data, image_shape, sigma)
+    
+    # Convert to 8-bit image
+    smoothed_image_8bit = (smoothed_image * 255).astype(np.uint8)
+    
+    # Read the original image for comparison
+    original_image = cv2.imread(original_image_path, cv2.IMREAD_GRAYSCALE)
+    original_image = cv2.resize(original_image, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
+    
+    # Create RGB versions of both images
+    smoothed_rgb = cv2.cvtColor(smoothed_image_8bit, cv2.COLOR_GRAY2RGB)
+    original_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
+    
+    # Combine images side by side
+    combined_image = np.hstack((smoothed_rgb, original_rgb))
+    
+    # Add titles using matplotlib
+    plt.figure(figsize=(12, 6))
+    plt.imshow(combined_image)
+    plt.text(image_shape[1] // 2, 20, "Kernel Smoothed", color='white', ha='center', fontsize=12)
+    plt.text(image_shape[1] + image_shape[1] // 2, 20, "Original Image", color='white', ha='center', fontsize=12)
+    plt.text(image_shape[1] // 2, image_shape[0] - 20, f"Sigma: {sigma}", color='white', ha='center', fontsize=10)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    
+    print(f"Kernel smoothed image saved to: {output_path}")
+
 def dump_network_weights(network, filename):
     """Dump network weights to a file in a human-readable format."""
     with open(filename, 'w') as f:
@@ -485,6 +570,12 @@ def full_pipeline(
     # Step 2: Sample training and validation data
     train_data, val_data = sample_data(data, train_size, val_size)
 
+    # Generate and save kernel smoothed image before training
+    seed_str = str(random_seed) if random_seed is not None else "none"
+    smoothed_image_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}-kernel-smoothed.png")
+    sigma = args.smoothing_sigma if args and hasattr(args, 'smoothing_sigma') else 3.0
+    save_kernel_smoothed_image(train_data, (height, width), smoothed_image_path, input_path, sigma=sigma)
+    
     # Step 3: Initialize the network
     input_dim = 3 if is_video else 2
     network = ReLUNetwork(input_dim, layer_sizes, debug=debug)
@@ -548,6 +639,8 @@ def parse_arguments():
                       help='Optimizer to use (default: adam)')
     parser.add_argument('--momentum', type=float, default=0.9,
                       help='Momentum factor for SGD with momentum (default: 0.9)')
+    parser.add_argument('--smoothing-sigma', type=float, default=3.0,
+                      help='Sigma parameter for Gaussian kernel smoothing (default: 3.0)')
     
     args = parser.parse_args()
     
