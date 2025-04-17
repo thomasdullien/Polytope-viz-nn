@@ -318,28 +318,58 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
             constant_activation_map = current_activation_hash
             print("Constant output but different activation map. Resetting counter.")
 
-    points_processed = 0
-    for i, (x_norm, y_norm, _) in enumerate(data):
-        x, y = int(x_norm * width), int(y_norm * height)
-        activation_map[y, x] = hash(tuple(activation_patterns[i])) & 0xFFFFFFFFFFFFFFFF
-        # Scale network output (0-1) back to 0-255 range and clamp values
-        prediction_map[y, x] = np.clip(outputs[i] * 255, 0, 255)
-        points_processed += 1
-
-    if points_processed == 0:
-        raise ValueError("No points were processed in the activation map loop. Check data format and dimensions.")
+    # Vectorized point processing
+    x_coords = np.round(data[:, 0] * (width - 1)).astype(int)
+    y_coords = np.round(data[:, 1] * (height - 1)).astype(int)
+    
+    # Ensure coordinates are in bounds
+    valid_indices = (0 <= x_coords) & (x_coords < width) & (0 <= y_coords) & (y_coords < height)
+    if not np.any(valid_indices):
+        raise ValueError("No valid points were found for processing. Check data format and dimensions.")
+    
+    # Filter valid data points
+    valid_x = x_coords[valid_indices]
+    valid_y = y_coords[valid_indices]
+    valid_activations = activation_patterns[valid_indices]
+    valid_outputs = outputs[valid_indices]
+    
+    # Process valid points vectorized
+    points_processed = len(valid_x)
+    print(f"Processing {points_processed} valid data points")
+    
+    # Create hashes for activation patterns (this part must still be done per-point)
+    activation_hashes = np.zeros(points_processed, dtype=np.uint64)
+    for i in range(points_processed):
+        activation_hashes[i] = hash(tuple(valid_activations[i])) & 0xFFFFFFFFFFFFFFFF
+    
+    # Assign to activation map
+    activation_map[valid_y, valid_x] = activation_hashes
+    
+    # Scale and assign to prediction map (vectorized)
+    scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
+    prediction_map[valid_y, valid_x] = scaled_outputs
 
     print(f"Prediction map range before uint8: min={prediction_map.min():.6f}, max={prediction_map.max():.6f}")
 
-    # Detect decision boundaries
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
-            neighbors = [
-                activation_map[y - 1, x], activation_map[y + 1, x],
-                activation_map[y, x - 1], activation_map[y, x + 1]
-            ]
-            if any(n != activation_map[y, x] for n in neighbors):
-                boundary_map[y, x] = 255
+    # Detect decision boundaries using vectorized operations
+    # Create shifted versions of the activation map
+    shifts = [
+        (0, 1),   # right
+        (0, -1),  # left
+        (1, 0),   # down
+        (-1, 0)   # up
+    ]
+    
+    # Create a mask where any neighbor differs from the center
+    center = activation_map[1:-1, 1:-1]
+    boundary_mask = np.zeros((height-2, width-2), dtype=bool)
+    
+    for dy, dx in shifts:
+        neighbor = activation_map[1+dy:height-1+dy, 1+dx:width-1+dx]
+        boundary_mask = boundary_mask | (neighbor != center)
+    
+    # Apply boundary mask to the boundary map
+    boundary_map[1:-1, 1:-1][boundary_mask] = 255
 
     # Convert prediction map to RGB
     prediction_map = prediction_map.astype(np.uint8)
@@ -357,19 +387,19 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     target_image = cv2.resize(target_image, (width, height), interpolation=cv2.INTER_NEAREST)  # Preserve sharp edges
     target_image_rgb = cv2.cvtColor(target_image, cv2.COLOR_GRAY2RGB).astype(np.uint8)  # Ensure correct format
 
-    # Apply training points (pure red)
-    for (x_norm, y_norm, _) in train_data:
-        x = int(np.round(x_norm * width))
-        y = int(np.round(y_norm * height))
-        if 0 <= x < width and 0 <= y < height:
-            target_image_rgb[y, x] = (255, 0, 0)
-
-    # Apply validation points (pure blue)
-    for (x_norm, y_norm, _) in val_data:
-        x = int(np.round(x_norm * width))
-        y = int(np.round(y_norm * height))
-        if 0 <= x < width and 0 <= y < height:
-            target_image_rgb[y, x] = (0, 0, 255)
+    # Apply training points (pure red) - vectorized
+    train_x = np.round(train_data[:, 0] * width).astype(int)
+    train_y = np.round(train_data[:, 1] * height).astype(int)
+    valid_train = (0 <= train_x) & (train_x < width) & (0 <= train_y) & (train_y < height)
+    if np.any(valid_train):
+        target_image_rgb[train_y[valid_train], train_x[valid_train]] = (255, 0, 0)
+    
+    # Apply validation points (pure blue) - vectorized
+    val_x = np.round(val_data[:, 0] * width).astype(int)
+    val_y = np.round(val_data[:, 1] * height).astype(int)
+    valid_val = (0 <= val_x) & (val_x < width) & (0 <= val_y) & (val_y < height)
+    if np.any(valid_val):
+        target_image_rgb[val_y[valid_val], val_x[valid_val]] = (0, 0, 255)
     
     # Concatenate three images side by side
     combined_image = np.hstack((rgb_prediction, rgb_prediction_no_boundaries, target_image_rgb))
@@ -584,6 +614,14 @@ def full_pipeline(
     from torchinfo import summary
     summary(network, input_size=(1024, 2))
     
+    # Apply torch.compile for acceleration if requested and available (PyTorch 2.0+)
+    if args.use_compile and hasattr(torch, 'compile'):
+        print("Using torch.compile for network acceleration")
+        network = torch.compile(network)
+    elif args.use_compile and not hasattr(torch, 'compile'):
+        print("Warning: torch.compile requested but not available. Requires PyTorch 2.0+")
+        print("Continuing without compilation")
+    
     # Step 4: Train and visualize decision boundaries
     boundary_frames = []
     for epoch in range(epochs):
@@ -641,6 +679,8 @@ def parse_arguments():
                       help='Momentum factor for SGD with momentum (default: 0.9)')
     parser.add_argument('--smoothing-sigma', type=float, default=3.0,
                       help='Sigma parameter for Gaussian kernel smoothing (default: 3.0)')
+    parser.add_argument('--use-compile', action='store_true',
+                      help='Use torch.compile to accelerate the neural network (requires PyTorch 2.0+)')
     
     args = parser.parse_args()
     
