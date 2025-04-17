@@ -584,6 +584,14 @@ def full_pipeline(
     from torchinfo import summary
     summary(network, input_size=(1024, 2))
     
+    # Apply torch.compile for acceleration if requested and available (PyTorch 2.0+)
+    if args.use_compile and hasattr(torch, 'compile'):
+        print("Using torch.compile for network acceleration")
+        network = torch.compile(network)
+    elif args.use_compile and not hasattr(torch, 'compile'):
+        print("Warning: torch.compile requested but not available. Requires PyTorch 2.0+")
+        print("Continuing without compilation")
+    
     # Step 4: Train and visualize decision boundaries
     boundary_frames = []
     for epoch in range(epochs):
@@ -641,6 +649,8 @@ def parse_arguments():
                       help='Momentum factor for SGD with momentum (default: 0.9)')
     parser.add_argument('--smoothing-sigma', type=float, default=3.0,
                       help='Sigma parameter for Gaussian kernel smoothing (default: 3.0)')
+    parser.add_argument('--use-compile', action='store_true',
+                      help='Use torch.compile to accelerate the neural network (requires PyTorch 2.0+)')
     
     args = parser.parse_args()
     
