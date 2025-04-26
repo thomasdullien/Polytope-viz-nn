@@ -317,7 +317,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     total_points = data.shape[0]
     num_chunks = (total_points + chunk_size - 1) // chunk_size  # Ceiling division
     
-    logger.info(f"Processing {total_points} points in {num_chunks} chunks of {chunk_size}")
+    logger.debug(f"Processing {total_points} points in {num_chunks} chunks of {chunk_size}")
     
     # Initialize arrays to collect results from all chunks
     all_outputs = []
@@ -329,7 +329,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
                 start_idx = i * chunk_size
                 end_idx = min(start_idx + chunk_size, total_points)
                 
-                logger.info(f"Processing chunk {i+1}/{num_chunks} (points {start_idx} to {end_idx})")
+                logger.debug(f"Processing chunk {i+1}/{num_chunks} (points {start_idx} to {end_idx})")
                 
                 # Process this chunk
                 chunk_data = data[start_idx:end_idx]
@@ -408,7 +408,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Process valid points vectorized
     points_processed = len(valid_x)
-    logger.info(f"Processing {points_processed} valid data points")
+    logger.debug(f"Processing {points_processed} valid data points")
     
     # Create hashes for activation patterns (this part must still be done per-point)
     activation_hashes = np.zeros(points_processed, dtype=np.uint64)
@@ -593,6 +593,36 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     smoothed_rgb = cv2.cvtColor(smoothed_image_8bit, cv2.COLOR_GRAY2RGB)
     original_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
     
+    # Let's directly use the approach from generate_kernel_smoothed_image
+    # Create a density map from training points
+    density = np.zeros(image_shape, dtype=np.float32)
+    
+    # Place training points on the density map
+    for x_norm, y_norm, _ in train_data:
+        x, y = int(np.round(x_norm * (image_shape[1]-1))), int(np.round(y_norm * (image_shape[0]-1)))
+        if 0 <= x < image_shape[1] and 0 <= y < image_shape[0]:
+            density[y, x] += 1
+    
+    # Apply Gaussian smoothing to get smooth transitions
+    smoothed_density = gaussian_filter(density, sigma=sigma)
+    
+    # Create a mask for significant density (areas with enough data points)
+    # Using a low threshold to include more of the smoothed area
+    threshold = 0.005 * smoothed_density.max() if smoothed_density.max() > 0 else 0
+    initialized_mask = smoothed_density > threshold
+    
+    # Create light cyan background for uninitialized areas
+    cyan_bg = np.zeros_like(smoothed_rgb)
+    cyan_bg[:,:,0] = 180  # Red channel (lighter)
+    cyan_bg[:,:,1] = 255  # Green channel (full)
+    cyan_bg[:,:,2] = 255  # Blue channel (full)
+    
+    # Apply blue to uninitialized areas while keeping the smoothed values for initialized areas
+    for y in range(image_shape[0]):
+        for x in range(image_shape[1]):
+            if not initialized_mask[y, x]:
+                smoothed_rgb[y, x] = cyan_bg[y, x]
+    
     # Combine images side by side
     combined_image = np.hstack((smoothed_rgb, original_rgb))
     
@@ -607,7 +637,7 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     plt.savefig(output_path)
     plt.close()
     
-    logger.info(f"Kernel smoothed image saved to: {output_path}")
+    logger.debug(f"Kernel smoothed image saved to: {output_path}")
 
 def dump_network_weights(network, filename):
     """Dump network weights to a file in a human-readable format."""
@@ -732,10 +762,13 @@ def full_pipeline(
             seed_str = str(random_seed) if random_seed is not None else "none"
             output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
             
-            logger.info(f"Starting visualization for epoch {epoch + 1}")
-            
-            # Time the visualization step
+            # Time the visualization step without extra logs
             start_time = time.time()
+            
+            # Temporarily change the logging level for the visualization duration
+            original_level = logger.level
+            if not debug:
+                logger.setLevel(logging.WARNING)  # Only show warnings and errors
             
             visualize_decision_boundary_with_predictions(
               network, data, train_data, val_data,
@@ -751,9 +784,12 @@ def full_pipeline(
               chunk_size=args.chunk_size if args and hasattr(args, 'chunk_size') else None
             )
             
+            # Restore original logging level
+            logger.setLevel(original_level)
+            
             end_time = time.time()
             duration = end_time - start_time
-            logger.info(f"Visualization for epoch {epoch + 1} completed in {duration:.2f} seconds")
+            logger.info(f"Visualization @ epoch {epoch + 1}: {duration:.2f}s")
             #boundary_frames.append(imageio.imread(output_path))
 
     # Step 5: Save video if processing a video input
