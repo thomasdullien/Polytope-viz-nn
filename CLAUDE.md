@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run script: `python draw-poly-while-training.py --input <image_path> --shape "<layer_sizes>" --epochs <number>`
 - Example: `python draw-poly-while-training.py --input centered_ring.png --shape "[10]*8" --epochs 100`
 - Run with acceleration: Add `--use-compile` flag to use torch.compile (requires PyTorch 2.0+)
+- Control visualization frequency: Add `--save-interval <N>` to save visualizations every N epochs (default: 1)
 
 ## Code Style Guidelines
 - Imports: Group standard library, third-party, and local imports in that order

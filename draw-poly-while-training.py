@@ -256,11 +256,6 @@ def check_loss_stagnation(current_loss, epoch, network_outputs=None):
 def visualize_decision_boundary_with_predictions(network, data, train_data, val_data, image_shape, output_path, target_image_path, train_loss=None, val_loss=None, network_shape_str=None, random_seed=None, epoch=None, num_points=None, learning_rate=None, optimizer=None, momentum=None):
     global constant_activation_map, constant_output_counter
     
-    # Check for optimization loops
-    if epoch is not None and check_optimization_loop(network, epoch):
-        dump_network_weights(network, "weights.txt")
-        exit(1)
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)  # Ensure network is on GPU
 
@@ -449,11 +444,6 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
     plt.show()
     plt.close()
-    
-    # Check for loss stagnation with network outputs
-    if train_loss is not None and check_loss_stagnation(train_loss, epoch, outputs):
-        dump_network_weights(network, "weights.txt")
-        exit(1)
 
 def generate_kernel_smoothed_image(train_data, image_shape, sigma=3.0):
     """
@@ -624,27 +614,51 @@ def full_pipeline(
     
     # Step 4: Train and visualize decision boundaries
     boundary_frames = []
+    save_interval = args.save_interval if args and hasattr(args, 'save_interval') else 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
         train_loss, val_loss = train_network(network, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args)
 
-        epoch_str = "%04d" % (epoch + 1)
-        seed_str = str(random_seed) if random_seed is not None else "none"
-        output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
-        visualize_decision_boundary_with_predictions(
-          network, data, train_data, val_data,
-          (height, width), output_path, input_path,
-          train_loss=train_loss, val_loss=val_loss,
-          network_shape_str=network_shape_str,
-          random_seed=random_seed,
-          epoch=epoch,
-          num_points=args.points if args else None,
-          learning_rate=args.learning_rate if args else None,
-          optimizer=args.optimizer if args else None,
-          momentum=args.momentum if args and args.optimizer == 'sgd_momentum' else None
-        )
-        #visualize_decision_boundary_with_predictions(network, data, (height, width), output_path)
-        #boundary_frames.append(imageio.imread(output_path))
+        # Check optimization problems on every epoch
+        network.eval()
+        with torch.no_grad():
+            # Create tensors for validation inputs if needed
+            if 'val_inputs' not in locals():
+                val_inputs = torch.tensor(val_data[:, :-1], dtype=torch.float32).to(device)
+            val_outputs, _ = network(val_inputs)
+        
+        # Check for optimization loops on every epoch
+        if check_optimization_loop(network, epoch):
+            dump_network_weights(network, os.path.join(output_dir, "weights_optimization_loop.txt"))
+            print("Optimization is looping. Aborting training.")
+            break
+            
+        # Check for loss stagnation on every epoch
+        if check_loss_stagnation(train_loss, epoch, val_outputs):
+            dump_network_weights(network, os.path.join(output_dir, "weights_stagnation.txt"))
+            print("Loss has stagnated and outputs are constant. Aborting training.")
+            break
+        
+        # Only visualize at save_interval or at the final epoch
+        if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
+            epoch_str = "%04d" % (epoch + 1)
+            seed_str = str(random_seed) if random_seed is not None else "none"
+            output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
+            visualize_decision_boundary_with_predictions(
+              network, data, train_data, val_data,
+              (height, width), output_path, input_path,
+              train_loss=train_loss, val_loss=val_loss,
+              network_shape_str=network_shape_str,
+              random_seed=random_seed,
+              epoch=epoch,
+              num_points=args.points if args else None,
+              learning_rate=args.learning_rate if args else None,
+              optimizer=args.optimizer if args else None,
+              momentum=args.momentum if args and args.optimizer == 'sgd_momentum' else None
+            )
+            #boundary_frames.append(imageio.imread(output_path))
 
     # Step 5: Save video if processing a video input
     if is_video:
@@ -681,6 +695,8 @@ def parse_arguments():
                       help='Sigma parameter for Gaussian kernel smoothing (default: 3.0)')
     parser.add_argument('--use-compile', action='store_true',
                       help='Use torch.compile to accelerate the neural network (requires PyTorch 2.0+)')
+    parser.add_argument('--save-interval', type=int, default=1,
+                      help='Save boundary visualization every N epochs (default: 1)')
     
     args = parser.parse_args()
     
