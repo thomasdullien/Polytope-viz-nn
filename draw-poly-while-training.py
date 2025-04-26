@@ -14,6 +14,53 @@ import sys
 import argparse
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
+import logging
+from datetime import datetime
+import time
+
+# Configure logging
+def setup_logger(log_file=None):
+    """Set up and configure the logger with optional file output.
+    
+    Args:
+        log_file: Optional path to a log file. If provided, logs will be written to this file
+                 in addition to the console output.
+    
+    Returns:
+        Configured logger instance
+    """
+    # Create logger
+    logger = logging.getLogger('polytope_nn')
+    logger.setLevel(logging.INFO)
+    
+    # Prevent adding handlers multiple times
+    if logger.handlers:
+        return logger
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Create console handler and set level
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # Add file handler if log file is specified
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logger.error(f"Failed to set up file logging to {log_file}: {str(e)}")
+    
+    return logger
+
+# Initialize logger without file logging yet - we'll update it in parse_arguments()
+logger = setup_logger()
 
 ### Neural Network Definition ###
 class ReLUNetwork(nn.Module):
@@ -51,7 +98,7 @@ class ReLUNetwork(nn.Module):
         activations = []
         # Debug: Track the range of values at each layer
         if self.debug:
-            print("\nLayer activations:")
+            logger.debug("\nLayer activations:")
         current = x
         for i, layer in enumerate(self.network):
             current = layer(current)
@@ -59,10 +106,10 @@ class ReLUNetwork(nn.Module):
                 # Count dead neurons (output = 0)
                 dead_neurons = (current == 0).float().mean().item()
                 if self.debug:
-                    print(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
+                    logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
                 activations.append((current > 0).int())  # Activation tracking
             elif isinstance(layer, nn.Linear) and self.debug:
-                print(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+                logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
 
         activation_pattern = torch.cat(activations, dim=1) if activations else None
         return current, activation_pattern
@@ -154,9 +201,9 @@ def train_network(network, train_data, val_data, epochs, batch_size, learning_ra
             val_loss = criterion(val_outputs, val_targets).item()
         
         if debug:
-            print(f"Epoch {epoch+1}/{epochs}")
-            print(f"Training Loss: {avg_train_loss:.6f}")
-            print(f"Validation Loss: {val_loss:.6f}")
+            logger.debug(f"Epoch {epoch+1}/{epochs}")
+            logger.debug(f"Training Loss: {avg_train_loss:.6f}")
+            logger.debug(f"Validation Loss: {val_loss:.6f}")
     
     # Return the final loss values
     return avg_train_loss, val_loss
@@ -190,8 +237,8 @@ def check_optimization_loop(network, epoch):
     # Check if we've seen these parameters before
     if param_hash in network_param_history:
         last_seen_epoch = network_param_history[param_hash]
-        print(f"WARNING: Network parameters at epoch {epoch} match those from epoch {last_seen_epoch}.")
-        print("The optimization is looping. Aborting training.")
+        logger.warning(f"Network parameters at epoch {epoch} match those from epoch {last_seen_epoch}.")
+        logger.warning("The optimization is looping. Aborting training.")
         return True
     
     # Update the history
@@ -239,27 +286,22 @@ def check_loss_stagnation(current_loss, epoch, network_outputs=None):
     
     # Only abort if both conditions are met
     if loss_stagnated and outputs_constant:
-        print(f"WARNING: Loss has stagnated AND network outputs are constant.")
-        print(f"Current loss: {current_loss:.6f}")
-        print(f"Average loss (last 30 epochs): {avg_30:.6f}")
-        print(f"Average loss (last 100 epochs): {avg_100:.6f}")
-        print(f"Average loss (last 200 epochs): {avg_200:.6f}")
-        print(f"Minimum loss (last 30 epochs): {min_30:.6f}")
-        print(f"Minimum loss (last 100 epochs): {min_100:.6f}")
-        print(f"Minimum loss (last 200 epochs): {min_200:.6f}")
-        print(f"Network output range: [{network_outputs.min():.6f}, {network_outputs.max():.6f}]")
-        print("Aborting training due to loss stagnation and constant outputs.")
+        logger.warning(f"Loss has stagnated AND network outputs are constant.")
+        logger.info(f"Current loss: {current_loss:.6f}")
+        logger.info(f"Average loss (last 30 epochs): {avg_30:.6f}")
+        logger.info(f"Average loss (last 100 epochs): {avg_100:.6f}")
+        logger.info(f"Average loss (last 200 epochs): {avg_200:.6f}")
+        logger.info(f"Minimum loss (last 30 epochs): {min_30:.6f}")
+        logger.info(f"Minimum loss (last 100 epochs): {min_100:.6f}")
+        logger.info(f"Minimum loss (last 200 epochs): {min_200:.6f}")
+        logger.info(f"Network output range: [{network_outputs.min():.6f}, {network_outputs.max():.6f}]")
+        logger.warning("Aborting training due to loss stagnation and constant outputs.")
         return True
     
     return False
 
-def visualize_decision_boundary_with_predictions(network, data, train_data, val_data, image_shape, output_path, target_image_path, train_loss=None, val_loss=None, network_shape_str=None, random_seed=None, epoch=None, num_points=None, learning_rate=None, optimizer=None, momentum=None):
+def visualize_decision_boundary_with_predictions(network, data, train_data, val_data, image_shape, output_path, target_image_path, train_loss=None, val_loss=None, network_shape_str=None, random_seed=None, epoch=None, num_points=None, learning_rate=None, optimizer=None, momentum=None, chunk_size=None):
     global constant_activation_map, constant_output_counter
-    
-    # Check for optimization loops
-    if epoch is not None and check_optimization_loop(network, epoch):
-        dump_network_weights(network, "weights.txt")
-        exit(1)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)  # Ensure network is on GPU
@@ -269,29 +311,58 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     prediction_map = np.zeros((height, width), dtype=np.float32)
     boundary_map = np.zeros((height, width), dtype=np.uint8)
 
-    # Move input data to GPU
-    inputs = torch.tensor(data[:, :-1], dtype=torch.float32).to(device)
+    # Process data in chunks to avoid memory issues
+    if chunk_size is None:
+        chunk_size = 128 * 1024  # Default: 128k points per chunk
+    total_points = data.shape[0]
+    num_chunks = (total_points + chunk_size - 1) // chunk_size  # Ceiling division
+    
+    logger.debug(f"Processing {total_points} points in {num_chunks} chunks of {chunk_size}")
+    
+    # Initialize arrays to collect results from all chunks
+    all_outputs = []
+    all_activation_patterns = []
+    
     try:
         with torch.no_grad():
-            outputs, activation_patterns = network(inputs)
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, total_points)
+                
+                logger.debug(f"Processing chunk {i+1}/{num_chunks} (points {start_idx} to {end_idx})")
+                
+                # Process this chunk
+                chunk_data = data[start_idx:end_idx]
+                chunk_inputs = torch.tensor(chunk_data[:, :-1], dtype=torch.float32).to(device)
+                
+                # Forward pass for this chunk
+                chunk_outputs, chunk_activation_patterns = network(chunk_inputs)
+                
+                # Collect results (move to CPU immediately to free GPU memory)
+                all_outputs.append(chunk_outputs.detach().cpu().numpy())
+                all_activation_patterns.append(chunk_activation_patterns.detach().cpu().numpy())
+                
+                # Explicitly free GPU memory
+                del chunk_inputs, chunk_outputs, chunk_activation_patterns
+                torch.cuda.empty_cache()
+    
     except Exception as e:
-        print(f"Error during network forward pass: {str(e)}")
-        print(f"Input shape: {inputs.shape}")
-        print(f"Input range: min={inputs.min():.6f}, max={inputs.max():.6f}")
-        print(f"Input dtype: {inputs.dtype}")
+        logger.error(f"Error during network forward pass: {str(e)}")
+        logger.error(f"Chunk index: {i}, Chunk size: {chunk_size}")
+        logger.error(f"Chunk input shape: {chunk_inputs.shape if 'chunk_inputs' in locals() else 'N/A'}")
         raise ValueError(f"Network forward pass failed: {str(e)}")
-
-    # Move back to CPU only when necessary
-    outputs = outputs.detach().cpu().numpy().flatten()
-    activation_patterns = activation_patterns.detach().cpu().numpy()
-
+    
+    # Combine results from all chunks
+    outputs = np.concatenate(all_outputs).flatten()
+    activation_patterns = np.concatenate(all_activation_patterns)
+    
     # Debug network outputs
-    print(f"Network outputs (len {len(outputs)}) range: min={outputs.min():.6f}, max={outputs.max():.6f}")
+    logger.debug(f"Network outputs (len {len(outputs)}) range: min={outputs.min():.6f}, max={outputs.max():.6f}")
     
     # Check if outputs are constant
     is_constant = outputs.min() == outputs.max()
     if is_constant:
-        print("WARNING: Network outputs are exactly constant (min == max). This indicates a serious problem with the network.")
+        logger.warning("Network outputs are exactly constant (min == max). This indicates a serious problem with the network.")
         
         # Create a hash of the activation map for comparison
         current_activation_hash = hash(activation_patterns.tobytes())
@@ -300,24 +371,25 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         if constant_activation_map is None:
             constant_activation_map = current_activation_hash
             constant_output_counter = 1
-            print(f"First constant output detected. Counter: {constant_output_counter}")
+            logger.warning(f"First constant output detected. Counter: {constant_output_counter}")
         # Check if activation map is the same as before
         elif constant_activation_map == current_activation_hash:
             constant_output_counter += 1
-            print(f"Same constant output detected. Counter: {constant_output_counter}")
+            logger.warning(f"Same constant output detected. Counter: {constant_output_counter}")
             
             # Abort if we've seen the same constant output too many times
             if constant_output_counter >= CONSTANT_OUTPUT_THRESHOLD:
-                print(f"ERROR: Network has produced the same constant output for {CONSTANT_OUTPUT_THRESHOLD} consecutive iterations.")
-                print("Aborting due to network failure.")
+                logger.error(f"Network has produced the same constant output for {CONSTANT_OUTPUT_THRESHOLD} consecutive iterations.")
+                logger.error("Aborting due to network failure.")
                 dump_network_weights(network, "weights.txt")
                 exit(1)
         else:
             # Reset counter if activation map changed
             constant_output_counter = 1
             constant_activation_map = current_activation_hash
-            print("Constant output but different activation map. Resetting counter.")
+            logger.warning("Constant output but different activation map. Resetting counter.")
 
+    
     # Vectorized point processing
     x_coords = np.round(data[:, 0] * (width - 1)).astype(int)
     y_coords = np.round(data[:, 1] * (height - 1)).astype(int)
@@ -325,6 +397,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Ensure coordinates are in bounds
     valid_indices = (0 <= x_coords) & (x_coords < width) & (0 <= y_coords) & (y_coords < height)
     if not np.any(valid_indices):
+        logger.error("No valid points were found for processing. Check data format and dimensions.")
         raise ValueError("No valid points were found for processing. Check data format and dimensions.")
     
     # Filter valid data points
@@ -335,7 +408,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Process valid points vectorized
     points_processed = len(valid_x)
-    print(f"Processing {points_processed} valid data points")
+    logger.debug(f"Processing {points_processed} valid data points")
     
     # Create hashes for activation patterns (this part must still be done per-point)
     activation_hashes = np.zeros(points_processed, dtype=np.uint64)
@@ -349,7 +422,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
     prediction_map[valid_y, valid_x] = scaled_outputs
 
-    print(f"Prediction map range before uint8: min={prediction_map.min():.6f}, max={prediction_map.max():.6f}")
+    logger.debug(f"Prediction map range before uint8: min={prediction_map.min():.6f}, max={prediction_map.max():.6f}")
 
     # Detect decision boundaries using vectorized operations
     # Create shifted versions of the activation map
@@ -373,7 +446,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
 
     # Convert prediction map to RGB
     prediction_map = prediction_map.astype(np.uint8)
-    print(f"Prediction map range after uint8: min={prediction_map.min()}, max={prediction_map.max()}")
+    logger.debug(f"Prediction map range after uint8: min={prediction_map.min()}, max={prediction_map.max()}")
 
     rgb_prediction = cv2.cvtColor(prediction_map, cv2.COLOR_GRAY2RGB)
     
@@ -450,10 +523,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     plt.show()
     plt.close()
     
-    # Check for loss stagnation with network outputs
-    if train_loss is not None and check_loss_stagnation(train_loss, epoch, outputs):
-        dump_network_weights(network, "weights.txt")
-        exit(1)
+    # No need for timing here, it's done at a higher level
 
 def generate_kernel_smoothed_image(train_data, image_shape, sigma=3.0):
     """
@@ -523,6 +593,36 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     smoothed_rgb = cv2.cvtColor(smoothed_image_8bit, cv2.COLOR_GRAY2RGB)
     original_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
     
+    # Let's directly use the approach from generate_kernel_smoothed_image
+    # Create a density map from training points
+    density = np.zeros(image_shape, dtype=np.float32)
+    
+    # Place training points on the density map
+    for x_norm, y_norm, _ in train_data:
+        x, y = int(np.round(x_norm * (image_shape[1]-1))), int(np.round(y_norm * (image_shape[0]-1)))
+        if 0 <= x < image_shape[1] and 0 <= y < image_shape[0]:
+            density[y, x] += 1
+    
+    # Apply Gaussian smoothing to get smooth transitions
+    smoothed_density = gaussian_filter(density, sigma=sigma)
+    
+    # Create a mask for significant density (areas with enough data points)
+    # Using a low threshold to include more of the smoothed area
+    threshold = 0.005 * smoothed_density.max() if smoothed_density.max() > 0 else 0
+    initialized_mask = smoothed_density > threshold
+    
+    # Create light cyan background for uninitialized areas
+    cyan_bg = np.zeros_like(smoothed_rgb)
+    cyan_bg[:,:,0] = 180  # Red channel (lighter)
+    cyan_bg[:,:,1] = 255  # Green channel (full)
+    cyan_bg[:,:,2] = 255  # Blue channel (full)
+    
+    # Apply blue to uninitialized areas while keeping the smoothed values for initialized areas
+    for y in range(image_shape[0]):
+        for x in range(image_shape[1]):
+            if not initialized_mask[y, x]:
+                smoothed_rgb[y, x] = cyan_bg[y, x]
+    
     # Combine images side by side
     combined_image = np.hstack((smoothed_rgb, original_rgb))
     
@@ -537,7 +637,7 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     plt.savefig(output_path)
     plt.close()
     
-    print(f"Kernel smoothed image saved to: {output_path}")
+    logger.debug(f"Kernel smoothed image saved to: {output_path}")
 
 def dump_network_weights(network, filename):
     """Dump network weights to a file in a human-readable format."""
@@ -586,6 +686,10 @@ def full_pipeline(
     debug=False,
     args=None
 ):
+    # Start timing the entire training process
+    training_start_time = time.time()
+    logger.info(f"Starting full training pipeline at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Preprocess data
@@ -604,53 +708,95 @@ def full_pipeline(
     seed_str = str(random_seed) if random_seed is not None else "none"
     smoothed_image_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}-kernel-smoothed.png")
     sigma = args.smoothing_sigma if args and hasattr(args, 'smoothing_sigma') else 3.0
+    
     save_kernel_smoothed_image(train_data, (height, width), smoothed_image_path, input_path, sigma=sigma)
     
     # Step 3: Initialize the network
     input_dim = 3 if is_video else 2
     network = ReLUNetwork(input_dim, layer_sizes, debug=debug)
     trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {trainable_params}")
+    logger.info(f"Trainable parameters: {trainable_params}")
     from torchinfo import summary
     summary(network, input_size=(1024, 2))
     
     # Apply torch.compile for acceleration if requested and available (PyTorch 2.0+)
     if args.use_compile and hasattr(torch, 'compile'):
-        print("Using torch.compile for network acceleration")
+        logger.info("Using torch.compile for network acceleration")
         network = torch.compile(network)
     elif args.use_compile and not hasattr(torch, 'compile'):
-        print("Warning: torch.compile requested but not available. Requires PyTorch 2.0+")
-        print("Continuing without compilation")
+        logger.warning("torch.compile requested but not available. Requires PyTorch 2.0+")
+        logger.info("Continuing without compilation")
     
     # Step 4: Train and visualize decision boundaries
     boundary_frames = []
+    save_interval = args.save_interval if args and hasattr(args, 'save_interval') else 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     for epoch in range(epochs):
-        print(f"Epoch {epoch + 1}/{epochs}")
         train_loss, val_loss = train_network(network, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args)
+        logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
-        epoch_str = "%04d" % (epoch + 1)
-        seed_str = str(random_seed) if random_seed is not None else "none"
-        output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
-        visualize_decision_boundary_with_predictions(
-          network, data, train_data, val_data,
-          (height, width), output_path, input_path,
-          train_loss=train_loss, val_loss=val_loss,
-          network_shape_str=network_shape_str,
-          random_seed=random_seed,
-          epoch=epoch,
-          num_points=args.points if args else None,
-          learning_rate=args.learning_rate if args else None,
-          optimizer=args.optimizer if args else None,
-          momentum=args.momentum if args and args.optimizer == 'sgd_momentum' else None
-        )
-        #visualize_decision_boundary_with_predictions(network, data, (height, width), output_path)
-        #boundary_frames.append(imageio.imread(output_path))
+        # Check optimization problems on every epoch
+        network.eval()
+        with torch.no_grad():
+            # Create tensors for validation inputs if needed
+            if 'val_inputs' not in locals():
+                val_inputs = torch.tensor(val_data[:, :-1], dtype=torch.float32).to(device)
+            val_outputs, _ = network(val_inputs)
+        
+        # Check for optimization loops on every epoch
+        if check_optimization_loop(network, epoch):
+            dump_network_weights(network, os.path.join(output_dir, "weights_optimization_loop.txt"))
+            logger.warning("Optimization is looping. Aborting training.")
+            break
+            
+        # Check for loss stagnation on every epoch
+        if check_loss_stagnation(train_loss, epoch, val_outputs):
+            dump_network_weights(network, os.path.join(output_dir, "weights_stagnation.txt"))
+            logger.warning("Loss has stagnated and outputs are constant. Aborting training.")
+            break
+        
+        # Only visualize at save_interval or at the final epoch
+        if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
+            epoch_str = "%04d" % (epoch + 1)
+            seed_str = str(random_seed) if random_seed is not None else "none"
+            output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
+            
+            # Time the visualization step without extra logs
+            start_time = time.time()
+            
+            # Temporarily change the logging level for the visualization duration
+            original_level = logger.level
+            if not debug:
+                logger.setLevel(logging.WARNING)  # Only show warnings and errors
+            
+            visualize_decision_boundary_with_predictions(
+              network, data, train_data, val_data,
+              (height, width), output_path, input_path,
+              train_loss=train_loss, val_loss=val_loss,
+              network_shape_str=network_shape_str,
+              random_seed=random_seed,
+              epoch=epoch,
+              num_points=args.points if args else None,
+              learning_rate=args.learning_rate if args else None,
+              optimizer=args.optimizer if args else None,
+              momentum=args.momentum if args and args.optimizer == 'sgd_momentum' else None,
+              chunk_size=args.chunk_size if args and hasattr(args, 'chunk_size') else None
+            )
+            
+            # Restore original logging level
+            logger.setLevel(original_level)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.info(f"Visualization @ epoch {epoch + 1}: {duration:.2f}s")
+            #boundary_frames.append(imageio.imread(output_path))
 
     # Step 5: Save video if processing a video input
     if is_video:
         video_output_path = os.path.join(output_dir, "boundary_evolution.mp4")
         imageio.mimsave(video_output_path, boundary_frames, fps=5)
-        print(f"Boundary evolution video saved at: {video_output_path}")
+        logger.info(f"Boundary evolution video saved at: {video_output_path}")
 
     # Step 6: Dump network weights
     weights_filename = os.path.join(output_dir, f"weights_{network_shape_b64}_{seed_str}.txt")
@@ -681,8 +827,25 @@ def parse_arguments():
                       help='Sigma parameter for Gaussian kernel smoothing (default: 3.0)')
     parser.add_argument('--use-compile', action='store_true',
                       help='Use torch.compile to accelerate the neural network (requires PyTorch 2.0+)')
+    parser.add_argument('--save-interval', type=int, default=1,
+                      help='Save boundary visualization every N epochs (default: 1)')
+    parser.add_argument('--chunk-size', type=int, default=128*1024,
+                      help='Number of points to process at once during visualization (default: 128K)')
+    parser.add_argument('--log-file', type=str, default=None,
+                      help='Path to the log file (default: log to console only)')
     
     args = parser.parse_args()
+    
+    # Set up logging with file if specified
+    global logger
+    if args.log_file:
+        logger = setup_logger(args.log_file)
+        
+    # Set debug level if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+            handler.setLevel(logging.DEBUG)
     
     # Create a string that includes all relevant parameters for the filename
     params_str = f"{args.shape}_{args.points}_{args.learning_rate}_{args.optimizer}"
@@ -710,6 +873,18 @@ def create_optimizer(network, args):
 # Parse arguments
 args, network_shape_b64 = parse_arguments()
 
+# Log the start of execution with important parameters
+logger.info("=== Starting polytope-viz-nn training ===")
+logger.info(f"Input image: {args.input}")
+logger.info(f"Network shape: {args.shape}")
+logger.info(f"Training epochs: {args.epochs}")
+logger.info(f"Points: {args.points}")
+logger.info(f"Optimizer: {args.optimizer}")
+logger.info(f"Learning rate: {args.learning_rate}")
+logger.info(f"Output directory: {args.output_dir}")
+if args.seed is not None:
+    logger.info(f"Random seed: {args.seed}")
+
 # Set random seed if provided
 if args.seed is not None:
     random.seed(args.seed)
@@ -720,21 +895,28 @@ if args.seed is not None:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    logger.info("Random seed set for all libraries")
 
 # Run the full pipeline
-full_pipeline(
-    input_path=args.input,
-    is_video=False,
-    train_size=args.points,
-    layer_sizes=eval(args.shape),
-    epochs=args.epochs,
-    batch_size=args.batch_size,
-    learning_rate=args.learning_rate,
-    output_dir=args.output_dir,
-    random_seed=args.seed,
-    network_shape_b64=network_shape_b64,
-    network_shape_str=args.shape,
-    debug=args.debug,
-    args=args  # Pass the full args object to access optimizer settings
-)
+try:
+    full_pipeline(
+        input_path=args.input,
+        is_video=False,
+        train_size=args.points,
+        layer_sizes=eval(args.shape),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        output_dir=args.output_dir,
+        random_seed=args.seed,
+        network_shape_b64=network_shape_b64,
+        network_shape_str=args.shape,
+        debug=args.debug,
+        args=args  # Pass the full args object to access optimizer settings
+    )
+    logger.info("=== Training completed successfully ===")
+except Exception as e:
+    logger.error(f"Training failed with error: {str(e)}")
+    logger.exception("Exception details:")
+    raise
 
