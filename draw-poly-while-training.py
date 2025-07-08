@@ -69,6 +69,12 @@ class ReLUNetwork(nn.Module):
         layers = []
         self.activation_layers = []
         self.debug = debug
+        
+        # Hash computation variables
+        self.activation_hashes = None
+        self.layer_index = 0
+        self.hooks = []
+        self.use_gpu_hashing = False
 
         prev_dim = input_dim
         for size in layer_sizes:
@@ -94,7 +100,75 @@ class ReLUNetwork(nn.Module):
         
         self.network = nn.Sequential(*layers)
 
+    def enable_gpu_hashing(self):
+        """Enable GPU-based hash computation using forward hooks."""
+        self.use_gpu_hashing = True
+        self.hooks = []
+        
+        # Register hooks for each LeakyReLU layer
+        for i, layer in enumerate(self.network):
+            if isinstance(layer, nn.LeakyReLU):
+                hook = layer.register_forward_hook(self._hash_hook)
+                self.hooks.append(hook)
+
+    def disable_gpu_hashing(self):
+        """Disable GPU-based hash computation and remove hooks."""
+        self.use_gpu_hashing = False
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+
+    def _hash_hook(self, module, input, output):
+        """Forward hook that accumulates hash values during forward pass."""
+        if not self.use_gpu_hashing:
+            return
+            
+        # Get activation pattern (> 0 for LeakyReLU)
+        activation_pattern = (output > 0).int()
+        
+        # Initialize hash tensor on first call
+        if self.activation_hashes is None:
+            batch_size = activation_pattern.size(0)
+            self.activation_hashes = torch.zeros(batch_size, dtype=torch.int64, device=output.device)
+            self.layer_index = 0
+        
+        # Compute hash contribution for this layer
+        # Use a simple but effective hash: sum of (activation_pattern * layer_powers)
+        # where layer_powers are powers of a prime number for each neuron
+        layer_contribution = self._compute_layer_hash(activation_pattern, self.layer_index)
+        
+        # Accumulate hash using XOR (commutative operation)
+        self.activation_hashes = self.activation_hashes ^ layer_contribution
+        self.layer_index += 1
+
+    def _compute_layer_hash(self, activation_pattern, layer_idx):
+        """Compute hash contribution for a single layer."""
+        batch_size, num_neurons = activation_pattern.shape
+        
+        # Create unique prime-based multipliers for each neuron in this layer
+        # Use layer_idx to make each layer's contribution unique
+        primes = torch.tensor([2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47], 
+                             dtype=torch.int64, device=activation_pattern.device)
+        
+        # Create layer-specific base multiplier
+        layer_base = primes[layer_idx % len(primes)]
+        
+        # Create neuron-specific multipliers
+        neuron_multipliers = torch.arange(1, num_neurons + 1, dtype=torch.int64, 
+                                        device=activation_pattern.device)
+        neuron_multipliers = neuron_multipliers * layer_base
+        
+        # Compute hash contribution: sum of (activation * neuron_multiplier)
+        layer_hash = torch.sum(activation_pattern.long() * neuron_multipliers.unsqueeze(0), dim=1)
+        
+        return layer_hash
+
     def forward(self, x):
+        # Reset hash computation for new forward pass
+        if self.use_gpu_hashing:
+            self.activation_hashes = None
+            self.layer_index = 0
+        
         activations = []
         # Debug: Track the range of values at each layer
         if self.debug:
@@ -107,12 +181,17 @@ class ReLUNetwork(nn.Module):
                 dead_neurons = (current == 0).float().mean().item()
                 if self.debug:
                     logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
-                activations.append((current > 0).int())  # Activation tracking
+                if not self.use_gpu_hashing:
+                    activations.append((current > 0).int())  # Activation tracking
             elif isinstance(layer, nn.Linear) and self.debug:
                 logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
 
-        activation_pattern = torch.cat(activations, dim=1) if activations else None
-        return current, activation_pattern
+        # Return activation pattern or hash depending on mode
+        if self.use_gpu_hashing:
+            return current, self.activation_hashes
+        else:
+            activation_pattern = torch.cat(activations, dim=1) if activations else None
+            return current, activation_pattern
 
 ### Data Preprocessing ###
 def preprocess_image(image_path):
@@ -311,6 +390,9 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     prediction_map = np.zeros((height, width), dtype=np.float32)
     boundary_map = np.zeros((height, width), dtype=np.uint8)
 
+    # Enable GPU hashing for faster computation
+    network.enable_gpu_hashing()
+
     # Process data in chunks to avoid memory issues
     if chunk_size is None:
         chunk_size = 128 * 1024  # Default: 128k points per chunk
@@ -321,7 +403,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Initialize arrays to collect results from all chunks
     all_outputs = []
-    all_activation_patterns = []
+    all_activation_hashes = []
     
     try:
         with torch.no_grad():
@@ -335,15 +417,15 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
                 chunk_data = data[start_idx:end_idx]
                 chunk_inputs = torch.tensor(chunk_data[:, :-1], dtype=torch.float32).to(device)
                 
-                # Forward pass for this chunk
-                chunk_outputs, chunk_activation_patterns = network(chunk_inputs)
+                # Forward pass for this chunk - now returns GPU-computed hashes
+                chunk_outputs, chunk_activation_hashes = network(chunk_inputs)
                 
                 # Collect results (move to CPU immediately to free GPU memory)
                 all_outputs.append(chunk_outputs.detach().cpu().numpy())
-                all_activation_patterns.append(chunk_activation_patterns.detach().cpu().numpy())
+                all_activation_hashes.append(chunk_activation_hashes.detach().cpu().numpy())
                 
                 # Explicitly free GPU memory
-                del chunk_inputs, chunk_outputs, chunk_activation_patterns
+                del chunk_inputs, chunk_outputs, chunk_activation_hashes
                 torch.cuda.empty_cache()
     
     except Exception as e:
@@ -352,9 +434,13 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         logger.error(f"Chunk input shape: {chunk_inputs.shape if 'chunk_inputs' in locals() else 'N/A'}")
         raise ValueError(f"Network forward pass failed: {str(e)}")
     
+    finally:
+        # Disable GPU hashing after visualization
+        network.disable_gpu_hashing()
+    
     # Combine results from all chunks
     outputs = np.concatenate(all_outputs).flatten()
-    activation_patterns = np.concatenate(all_activation_patterns)
+    activation_hashes = np.concatenate(all_activation_hashes)
     
     # Debug network outputs
     logger.debug(f"Network outputs (len {len(outputs)}) range: min={outputs.min():.6f}, max={outputs.max():.6f}")
@@ -364,8 +450,8 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     if is_constant:
         logger.warning("Network outputs are exactly constant (min == max). This indicates a serious problem with the network.")
         
-        # Create a hash of the activation map for comparison
-        current_activation_hash = hash(activation_patterns.tobytes())
+        # Create a hash of the activation hashes for comparison
+        current_activation_hash = hash(activation_hashes.tobytes())
         
         # Check if this is the first constant output
         if constant_activation_map is None:
@@ -403,20 +489,18 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Filter valid data points
     valid_x = x_coords[valid_indices]
     valid_y = y_coords[valid_indices]
-    valid_activations = activation_patterns[valid_indices]
+    valid_hashes = activation_hashes[valid_indices]
     valid_outputs = outputs[valid_indices]
     
     # Process valid points vectorized
     points_processed = len(valid_x)
     logger.debug(f"Processing {points_processed} valid data points")
     
-    # Create hashes for activation patterns (this part must still be done per-point)
-    activation_hashes = np.zeros(points_processed, dtype=np.uint64)
-    for i in range(points_processed):
-        activation_hashes[i] = hash(tuple(valid_activations[i])) & 0xFFFFFFFFFFFFFFFF
+    # Convert int64 hashes to uint64 for consistency with original code
+    valid_hashes_uint64 = valid_hashes.astype(np.uint64)
     
-    # Assign to activation map
-    activation_map[valid_y, valid_x] = activation_hashes
+    # Assign to activation map (now using pre-computed GPU hashes)
+    activation_map[valid_y, valid_x] = valid_hashes_uint64
     
     # Scale and assign to prediction map (vectorized)
     scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
