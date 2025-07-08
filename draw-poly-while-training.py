@@ -63,15 +63,15 @@ def setup_logger(log_file=None):
 logger = setup_logger()
 
 ### Neural Network Definition ###
-class ReLUNetwork(nn.Module):
+class PolytopeNet(nn.Module):
     def __init__(self, input_dim, layer_sizes, debug=False):
-        super(ReLUNetwork, self).__init__()
+        super(PolytopeNet, self).__init__()
         layers = []
         self.activation_layers = []
         self.debug = debug
 
         prev_dim = input_dim
-        for size in layer_sizes:
+        for i, size in enumerate(layer_sizes):
             # Create linear layer
             linear_layer = nn.Linear(prev_dim, size)
             # Initialize weights using He initialization
@@ -84,6 +84,9 @@ class ReLUNetwork(nn.Module):
             leaky_relu_layer = nn.LeakyReLU(negative_slope=0.01)
             layers.append(leaky_relu_layer)
             self.activation_layers.append(leaky_relu_layer)
+            
+            # Register a buffer for the random hash values for this layer's activations
+            self.register_buffer(f'hash_coeffs_{i}', torch.randint(1, 2**63-1, (size,), dtype=torch.int64))
             prev_dim = size
 
         # Create and initialize output layer
@@ -94,25 +97,46 @@ class ReLUNetwork(nn.Module):
         
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
-        activations = []
-        # Debug: Track the range of values at each layer
-        if self.debug:
-            logger.debug("\nLayer activations:")
-        current = x
-        for i, layer in enumerate(self.network):
-            current = layer(current)
-            if isinstance(layer, nn.LeakyReLU):
-                # Count dead neurons (output = 0)
-                dead_neurons = (current == 0).float().mean().item()
-                if self.debug:
-                    logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
-                activations.append((current > 0).int())  # Activation tracking
-            elif isinstance(layer, nn.Linear) and self.debug:
-                logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+    def forward(self, x, visualizing=False):
+        if not visualizing:
+            activations = []
+            # Debug: Track the range of values at each layer
+            if self.debug:
+                logger.debug("\nLayer activations:")
+            current = x
+            for i, layer in enumerate(self.network):
+                current = layer(current)
+                if isinstance(layer, nn.LeakyReLU):
+                    # Count dead neurons (output = 0)
+                    dead_neurons = (current == 0).float().mean().item()
+                    if self.debug:
+                        logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
+                    activations.append((current > 0).int())  # Activation tracking
+                elif isinstance(layer, nn.Linear) and self.debug:
+                    logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
 
-        activation_pattern = torch.cat(activations, dim=1) if activations else None
-        return current, activation_pattern
+            activation_pattern = torch.cat(activations, dim=1) if activations else None
+            return current, activation_pattern
+        else:
+            # Optimized path for visualization - calculate hash on GPU
+            polytope_hash = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
+            current = x
+            layer_idx = 0
+            for layer in self.network:
+                current = layer(current)
+                if isinstance(layer, nn.LeakyReLU):
+                    # Get activation pattern (1s for active, 0 for inactive)
+                    activation_pattern = (current > 0).long()
+                    
+                    # Get hash coefficients for this layer
+                    hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
+                    
+                    # Update hash: hash += sum(activation * coeff)
+                    polytope_hash += torch.matmul(activation_pattern.float(), hash_coeffs.float()).long()
+                    
+                    layer_idx += 1
+            
+            return current, polytope_hash
 
 ### Data Preprocessing ###
 def preprocess_image(image_path):
@@ -321,7 +345,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Initialize arrays to collect results from all chunks
     all_outputs = []
-    all_activation_patterns = []
+    all_activation_hashes = []
     
     try:
         with torch.no_grad():
@@ -335,15 +359,15 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
                 chunk_data = data[start_idx:end_idx]
                 chunk_inputs = torch.tensor(chunk_data[:, :-1], dtype=torch.float32).to(device)
                 
-                # Forward pass for this chunk
-                chunk_outputs, chunk_activation_patterns = network(chunk_inputs)
+                # Forward pass for this chunk with visualization enabled
+                chunk_outputs, chunk_activation_hashes = network(chunk_inputs, visualizing=True)
                 
                 # Collect results (move to CPU immediately to free GPU memory)
                 all_outputs.append(chunk_outputs.detach().cpu().numpy())
-                all_activation_patterns.append(chunk_activation_patterns.detach().cpu().numpy())
+                all_activation_hashes.append(chunk_activation_hashes.detach().cpu().numpy())
                 
                 # Explicitly free GPU memory
-                del chunk_inputs, chunk_outputs, chunk_activation_patterns
+                del chunk_inputs, chunk_outputs, chunk_activation_hashes
                 torch.cuda.empty_cache()
     
     except Exception as e:
@@ -354,7 +378,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Combine results from all chunks
     outputs = np.concatenate(all_outputs).flatten()
-    activation_patterns = np.concatenate(all_activation_patterns)
+    activation_hashes = np.concatenate(all_activation_hashes)
     
     # Debug network outputs
     logger.debug(f"Network outputs (len {len(outputs)}) range: min={outputs.min():.6f}, max={outputs.max():.6f}")
@@ -365,7 +389,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         logger.warning("Network outputs are exactly constant (min == max). This indicates a serious problem with the network.")
         
         # Create a hash of the activation map for comparison
-        current_activation_hash = hash(activation_patterns.tobytes())
+        current_activation_hash = hash(activation_hashes.tobytes())
         
         # Check if this is the first constant output
         if constant_activation_map is None:
@@ -403,20 +427,15 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Filter valid data points
     valid_x = x_coords[valid_indices]
     valid_y = y_coords[valid_indices]
-    valid_activations = activation_patterns[valid_indices]
+    valid_hashes = activation_hashes[valid_indices]
     valid_outputs = outputs[valid_indices]
     
     # Process valid points vectorized
     points_processed = len(valid_x)
     logger.debug(f"Processing {points_processed} valid data points")
     
-    # Create hashes for activation patterns (this part must still be done per-point)
-    activation_hashes = np.zeros(points_processed, dtype=np.uint64)
-    for i in range(points_processed):
-        activation_hashes[i] = hash(tuple(valid_activations[i])) & 0xFFFFFFFFFFFFFFFF
-    
     # Assign to activation map
-    activation_map[valid_y, valid_x] = activation_hashes
+    activation_map[valid_y, valid_x] = valid_hashes
     
     # Scale and assign to prediction map (vectorized)
     scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
@@ -713,7 +732,7 @@ def full_pipeline(
     
     # Step 3: Initialize the network
     input_dim = 3 if is_video else 2
-    network = ReLUNetwork(input_dim, layer_sizes, debug=debug)
+    network = PolytopeNet(input_dim, layer_sizes, debug=debug)
     trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {trainable_params}")
     from torchinfo import summary
