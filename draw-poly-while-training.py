@@ -70,6 +70,9 @@ class PolytopeNet(nn.Module):
         self.activation_layers = []
         self.debug = debug
 
+        # Save the random state
+        rng_state = torch.get_rng_state()
+        
         prev_dim = input_dim
         for i, size in enumerate(layer_sizes):
             # Create linear layer
@@ -86,7 +89,7 @@ class PolytopeNet(nn.Module):
             self.activation_layers.append(leaky_relu_layer)
             
             # Register a buffer for the random hash values for this layer's activations
-            self.register_buffer(f'hash_coeffs_{i}', torch.randint(1, 2**63-1, (size,), dtype=torch.int64))
+            self.register_buffer(f'hash_coeffs_{i}', torch.randint(1, 2**31-1, (size,), dtype=torch.int64))
             prev_dim = size
 
         # Create and initialize output layer
@@ -96,6 +99,9 @@ class PolytopeNet(nn.Module):
         layers.append(output_layer)
         
         self.network = nn.Sequential(*layers)
+
+        # Restore the random state
+        torch.set_rng_state(rng_state)
 
     def forward(self, x, visualizing=False):
         if not visualizing:
@@ -126,7 +132,7 @@ class PolytopeNet(nn.Module):
                 current = layer(current)
                 if isinstance(layer, nn.LeakyReLU):
                     # Get activation pattern (1s for active, 0 for inactive)
-                    activation_pattern = (current > 0).long()
+                    activation_pattern = (current > 0)
                     
                     # Get hash coefficients for this layer
                     hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
@@ -137,6 +143,7 @@ class PolytopeNet(nn.Module):
                     layer_idx += 1
             
             return current, polytope_hash
+
 
 ### Data Preprocessing ###
 def preprocess_image(image_path):
