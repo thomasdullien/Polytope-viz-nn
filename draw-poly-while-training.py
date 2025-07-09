@@ -17,6 +17,7 @@ from scipy.ndimage import gaussian_filter
 import logging
 from datetime import datetime
 import time
+import subprocess
 
 # Configure logging
 def setup_logger(log_file=None):
@@ -772,7 +773,7 @@ def full_pipeline(
         
         # Only visualize at save_interval or at the final epoch
         if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
-            epoch_str = "%04d" % (epoch + 1)
+            epoch_str = "%06d" % (epoch + 1)
             seed_str = str(random_seed) if random_seed is not None else "none"
             output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
             
@@ -815,6 +816,38 @@ def full_pipeline(
     # Step 6: Dump network weights
     weights_filename = os.path.join(output_dir, f"weights_{network_shape_b64}_{seed_str}.txt")
     dump_network_weights(network, weights_filename)
+
+    # Step 7: Generate video from PNGs
+    logger.info("Starting video generation...")
+    base_filename = f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}"
+    glob_pattern = os.path.join(output_dir, f"{base_filename}_epoch_*.png")
+    video_output_path = os.path.join(output_dir, f"{base_filename}.mp4")
+
+    ffmpeg_command = [
+        'ffmpeg',
+        '-y',  # Overwrite output file if it exists
+        '-framerate', '24',
+        '-pattern_type', 'glob',
+        '-i', glob_pattern,
+        '-c:v', 'libx264',
+        '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        video_output_path
+    ]
+
+    try:
+        # Using f-string for the command for clarity and safety with trusted inputs
+        logger.info(f"Running ffmpeg command: {' '.join(ffmpeg_command)}")
+        result = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        logger.info("ffmpeg stdout:\n" + result.stdout)
+        logger.info("ffmpeg stderr:\n" + result.stderr)
+        logger.info(f"Video generated successfully: {video_output_path}")
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please ensure ffmpeg is installed and in your system's PATH.")
+    except subprocess.CalledProcessError as e:
+        logger.error("ffmpeg command failed.")
+        logger.error("ffmpeg stdout:\n" + e.stdout)
+        logger.error("ffmpeg stderr:\n" + e.stderr)
 
 def parse_arguments():
     """Parse command line arguments using argparse."""
