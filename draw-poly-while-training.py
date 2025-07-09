@@ -103,46 +103,32 @@ class PolytopeNet(nn.Module):
         # Restore the random state
         torch.set_rng_state(rng_state)
 
-    def forward(self, x, visualizing=False):
-        if not visualizing:
-            activations = []
-            # Debug: Track the range of values at each layer
-            if self.debug:
-                logger.debug("\nLayer activations:")
-            current = x
-            for i, layer in enumerate(self.network):
-                current = layer(current)
-                if isinstance(layer, nn.LeakyReLU):
-                    # Count dead neurons (output = 0)
-                    dead_neurons = (current == 0).float().mean().item()
-                    if self.debug:
-                        logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
-                    activations.append((current > 0).int())  # Activation tracking
-                elif isinstance(layer, nn.Linear) and self.debug:
-                    logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+    def forward(self, x):
+        # Unified path for both training and visualization
+        polytope_hash = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
+        current = x
+        layer_idx = 0
 
-            activation_pattern = torch.cat(activations, dim=1) if activations else None
-            return current, activation_pattern
-        else:
-            # Optimized path for visualization - calculate hash on GPU
-            polytope_hash = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
-            current = x
-            layer_idx = 0
-            for layer in self.network:
-                current = layer(current)
-                if isinstance(layer, nn.LeakyReLU):
-                    # Get activation pattern (1s for active, 0 for inactive)
-                    activation_pattern = (current > 0)
-                    
-                    # Get hash coefficients for this layer
-                    hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
-                    
-                    # Update hash: hash += sum(activation * coeff)
-                    polytope_hash += torch.matmul(activation_pattern.float(), hash_coeffs.float()).long()
-                    
-                    layer_idx += 1
+        for i, layer in enumerate(self.network):
+            current = layer(current)
+            if isinstance(layer, nn.LeakyReLU):
+                # --- Polytope Hash Calculation ---
+                activation_pattern = (current > 0)
+                hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
+                polytope_hash += (activation_pattern * hash_coeffs).sum(dim=1)
+                layer_idx += 1
+
+                # --- Debug Logic (guarded to prevent graph breaks) ---
+                if self.debug:
+                    # This block does not run when debug is False,
+                    # allowing torch.compile to ignore it.
+                    dead_neurons = (current == 0).float().mean().item()
+                    logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
             
-            return current, polytope_hash
+            elif self.debug and isinstance(layer, nn.Linear):
+                 logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+
+        return current, polytope_hash
 
 
 ### Data Preprocessing ###
@@ -366,8 +352,8 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
                 chunk_data = data[start_idx:end_idx]
                 chunk_inputs = torch.tensor(chunk_data[:, :-1], dtype=torch.float32).to(device)
                 
-                # Forward pass for this chunk with visualization enabled
-                chunk_outputs, chunk_activation_hashes = network(chunk_inputs, visualizing=True)
+                # Forward pass for this chunk
+                chunk_outputs, chunk_activation_hashes = network(chunk_inputs)
                 
                 # Collect results (move to CPU immediately to free GPU memory)
                 all_outputs.append(chunk_outputs.detach().cpu().numpy())
@@ -506,48 +492,50 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Get epoch number from filename
     epoch_num = int(output_path.split('_epoch_')[1].split('.')[0])
     
-    # Create figure and display image
-    plt.figure(figsize=(18, 6))
-    plt.imshow(combined_image, interpolation='nearest', vmin=0, vmax=255)
+    # Add text using cv2
+    text_x = 2 * width + 10
+    text_y = 30
+    vertical_spacing = 30
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    font_color = (0, 0, 255)  # Red in BGR
+    thickness = 1
+
+    # List of text lines to add
+    text_lines = [
+        f'Epoch: {epoch_num}',
+        f'Train Loss: {train_loss:.4f}' if train_loss is not None else None,
+        f'Val Loss: {val_loss:.4f}' if val_loss is not None else None,
+        f'Shape: {network_shape_str}' if network_shape_str is not None else None,
+        f'Seed: {random_seed}' if random_seed is not None else None,
+        f'Points: {num_points}' if num_points is not None else None,
+        f'LR: {learning_rate}' if learning_rate is not None else None,
+    ]
     
-    # Add text using matplotlib with increased vertical spacing
-    # Position text at the start of the third image (2*width pixels from the left)
-    text_x = 2 * width + 10  # Start 10 pixels into the third image
-    text_y = 30  # Initial y position
-    vertical_spacing = 30  # Spacing between lines
-    plt.text(text_x, text_y, f'Epoch: {epoch_num}', color='red', fontsize=10)
-    if train_loss is not None:
-        plt.text(text_x, text_y + vertical_spacing, f'Train Loss: {train_loss:.4f}', color='red', fontsize=10)
-    if val_loss is not None:
-        plt.text(text_x, text_y + 2*vertical_spacing, f'Val Loss: {val_loss:.4f}', color='red', fontsize=10)
-    if network_shape_str is not None:
-        plt.text(text_x, text_y + 3*vertical_spacing, f'Shape: {network_shape_str}', color='red', fontsize=10)
-    if random_seed is not None:
-        plt.text(text_x, text_y + 4*vertical_spacing, f'Seed: {random_seed}', color='red', fontsize=10)
-    
-    # Add additional parameters
-    if num_points is not None:
-        plt.text(text_x, text_y + 5*vertical_spacing, f'Points: {num_points}', color='red', fontsize=10)
-    if learning_rate is not None:
-        plt.text(text_x, text_y + 6*vertical_spacing, f'LR: {learning_rate}', color='red', fontsize=10)
     if optimizer is not None:
         optimizer_text = f'Optimizer: {optimizer}'
         if optimizer == 'sgd_momentum' and momentum is not None:
             optimizer_text += f' (mom={momentum})'
-        plt.text(text_x, text_y + 7*vertical_spacing, optimizer_text, color='red', fontsize=10)
-    
+        text_lines.append(optimizer_text)
+
+    # Add text to the image
+    current_y = text_y
+    # Filter out None values from text_lines
+    for line in filter(None, text_lines):
+        cv2.putText(combined_image, line, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        current_y += vertical_spacing
+
     # Add warning if outputs are constant
     if is_constant:
         warning_text = f'WARNING: Constant output ({outputs.min():.6f})'
-        plt.text(text_x, text_y + 8*vertical_spacing, warning_text, color='red', fontsize=10, fontweight='bold')
+        cv2.putText(combined_image, warning_text, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        current_y += vertical_spacing
         if constant_output_counter > 1:
             counter_text = f'Constant counter: {constant_output_counter}/{CONSTANT_OUTPUT_THRESHOLD}'
-            plt.text(text_x, text_y + 9*vertical_spacing, counter_text, color='red', fontsize=10)
-    
-    plt.axis("off")
-    plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
-    plt.show()
-    plt.close()
+            cv2.putText(combined_image, counter_text, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
+    # Save the image
+    cv2.imwrite(output_path, combined_image)
     
     # No need for timing here, it's done at a higher level
 
