@@ -382,6 +382,9 @@ def check_loss_stagnation(current_loss, epoch, network_outputs=None):
 def visualize_decision_boundary_with_predictions(network, data, train_data, val_data, image_shape, output_path, target_image_path, train_loss=None, val_loss=None, network_shape_str=None, random_seed=None, epoch=None, num_points=None, learning_rate=None, optimizer=None, momentum=None, chunk_size=None):
     global constant_activation_map, constant_output_counter
     
+    start_time = time.time()
+    print(f"[TIMING] Starting visualization for epoch {epoch}")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)  # Ensure network is on GPU
 
@@ -394,16 +397,22 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     network.enable_gpu_hashing()
 
     # Process data in chunks to avoid memory issues
-    if chunk_size is None:
-        chunk_size = 128 * 1024  # Default: 128k points per chunk
     total_points = data.shape[0]
+    if chunk_size is None:
+        # Optimize chunk size based on GPU memory and network size
+        # For modern GPUs with sufficient memory, process all data at once for best throughput
+        # This eliminates overhead from multiple GPU kernel launches
+        chunk_size = max(1024 * 1024, total_points)  # Optimized: 1M points or all data at once
     num_chunks = (total_points + chunk_size - 1) // chunk_size  # Ceiling division
     
     logger.debug(f"Processing {total_points} points in {num_chunks} chunks of {chunk_size}")
+    print(f"[TIMING] Processing {total_points} points in {num_chunks} chunks of {chunk_size}")
     
     # Initialize arrays to collect results from all chunks
     all_outputs = []
     all_activation_hashes = []
+    
+    forward_start_time = time.time()
     
     try:
         with torch.no_grad():
@@ -438,7 +447,11 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         # Disable GPU hashing after visualization
         network.disable_gpu_hashing()
     
+    forward_end_time = time.time()
+    print(f"[TIMING] Forward pass took {forward_end_time - forward_start_time:.3f} seconds")
+    
     # Combine results from all chunks
+    postprocess_start_time = time.time()
     outputs = np.concatenate(all_outputs).flatten()
     activation_hashes = np.concatenate(all_activation_hashes)
     
@@ -477,6 +490,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
 
     
     # Vectorized point processing
+    coord_start_time = time.time()
     x_coords = np.round(data[:, 0] * (width - 1)).astype(int)
     y_coords = np.round(data[:, 1] * (height - 1)).astype(int)
     
@@ -506,9 +520,13 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
     prediction_map[valid_y, valid_x] = scaled_outputs
 
+    coord_end_time = time.time()
+    print(f"[TIMING] Coordinate processing took {coord_end_time - coord_start_time:.3f} seconds")
+
     logger.debug(f"Prediction map range before uint8: min={prediction_map.min():.6f}, max={prediction_map.max():.6f}")
 
     # Detect decision boundaries using vectorized operations
+    boundary_start_time = time.time()
     # Create shifted versions of the activation map
     shifts = [
         (0, 1),   # right
@@ -528,7 +546,11 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Apply boundary mask to the boundary map
     boundary_map[1:-1, 1:-1][boundary_mask] = 255
 
+    boundary_end_time = time.time()
+    print(f"[TIMING] Boundary detection took {boundary_end_time - boundary_start_time:.3f} seconds")
+
     # Convert prediction map to RGB
+    image_start_time = time.time()
     prediction_map = prediction_map.astype(np.uint8)
     logger.debug(f"Prediction map range after uint8: min={prediction_map.min()}, max={prediction_map.max()}")
 
@@ -561,53 +583,85 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Concatenate three images side by side
     combined_image = np.hstack((rgb_prediction, rgb_prediction_no_boundaries, target_image_rgb))
     
+    image_end_time = time.time()
+    print(f"[TIMING] Image processing took {image_end_time - image_start_time:.3f} seconds")
+    
     # Get epoch number from filename
     epoch_num = int(output_path.split('_epoch_')[1].split('.')[0])
     
-    # Create figure and display image
-    plt.figure(figsize=(18, 6))
-    plt.imshow(combined_image, interpolation='nearest', vmin=0, vmax=255)
+    # Create figure and display image using OpenCV for better performance
+    plot_start_time = time.time()
     
-    # Add text using matplotlib with increased vertical spacing
+    # Make a copy of the image for annotation
+    annotated_image = combined_image.copy()
+    
+    # Add text annotations using OpenCV
     # Position text at the start of the third image (2*width pixels from the left)
     text_x = 2 * width + 10  # Start 10 pixels into the third image
     text_y = 30  # Initial y position
     vertical_spacing = 30  # Spacing between lines
-    plt.text(text_x, text_y, f'Epoch: {epoch_num}', color='red', fontsize=10)
+    
+    # OpenCV text parameters
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    color = (0, 0, 255)  # Red color in BGR
+    thickness = 1
+    
+    # Add text annotations
+    cv2.putText(annotated_image, f'Epoch: {epoch_num}', (text_x, text_y), font, font_scale, color, thickness)
+    
+    line_num = 1
     if train_loss is not None:
-        plt.text(text_x, text_y + vertical_spacing, f'Train Loss: {train_loss:.4f}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'Train Loss: {train_loss:.4f}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     if val_loss is not None:
-        plt.text(text_x, text_y + 2*vertical_spacing, f'Val Loss: {val_loss:.4f}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'Val Loss: {val_loss:.4f}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     if network_shape_str is not None:
-        plt.text(text_x, text_y + 3*vertical_spacing, f'Shape: {network_shape_str}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'Shape: {network_shape_str}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     if random_seed is not None:
-        plt.text(text_x, text_y + 4*vertical_spacing, f'Seed: {random_seed}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'Seed: {random_seed}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     
     # Add additional parameters
     if num_points is not None:
-        plt.text(text_x, text_y + 5*vertical_spacing, f'Points: {num_points}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'Points: {num_points}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     if learning_rate is not None:
-        plt.text(text_x, text_y + 6*vertical_spacing, f'LR: {learning_rate}', color='red', fontsize=10)
+        cv2.putText(annotated_image, f'LR: {learning_rate}', (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     if optimizer is not None:
         optimizer_text = f'Optimizer: {optimizer}'
         if optimizer == 'sgd_momentum' and momentum is not None:
             optimizer_text += f' (mom={momentum})'
-        plt.text(text_x, text_y + 7*vertical_spacing, optimizer_text, color='red', fontsize=10)
+        cv2.putText(annotated_image, optimizer_text, (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
+        line_num += 1
     
     # Add warning if outputs are constant
     if is_constant:
         warning_text = f'WARNING: Constant output ({outputs.min():.6f})'
-        plt.text(text_x, text_y + 8*vertical_spacing, warning_text, color='red', fontsize=10, fontweight='bold')
+        cv2.putText(annotated_image, warning_text, (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness + 1)  # Bold effect
+        line_num += 1
         if constant_output_counter > 1:
             counter_text = f'Constant counter: {constant_output_counter}/{CONSTANT_OUTPUT_THRESHOLD}'
-            plt.text(text_x, text_y + 9*vertical_spacing, counter_text, color='red', fontsize=10)
+            cv2.putText(annotated_image, counter_text, (text_x, text_y + line_num*vertical_spacing), font, font_scale, color, thickness)
     
-    plt.axis("off")
-    plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
-    plt.show()
-    plt.close()
+    # Save image using OpenCV (much faster than matplotlib)
+    cv2.imwrite(output_path, annotated_image)
     
-    # No need for timing here, it's done at a higher level
+    plot_end_time = time.time()
+    print(f"[TIMING] Plot generation took {plot_end_time - plot_start_time:.3f} seconds")
+    
+    total_time = time.time() - start_time
+    print(f"[TIMING] Total visualization took {total_time:.3f} seconds")
+    
+    # Performance summary
+    print(f"[TIMING] Performance breakdown: Forward={forward_end_time - forward_start_time:.3f}s, "
+                f"Postprocess={postprocess_start_time - coord_start_time:.3f}s, "
+                f"Boundary={boundary_end_time - boundary_start_time:.3f}s, "
+                f"Image={image_end_time - image_start_time:.3f}s, "
+                f"Plot={plot_end_time - plot_start_time:.3f}s")
 
 def generate_kernel_smoothed_image(train_data, image_shape, sigma=3.0):
     """
@@ -913,8 +967,8 @@ def parse_arguments():
                       help='Use torch.compile to accelerate the neural network (requires PyTorch 2.0+)')
     parser.add_argument('--save-interval', type=int, default=1,
                       help='Save boundary visualization every N epochs (default: 1)')
-    parser.add_argument('--chunk-size', type=int, default=128*1024,
-                      help='Number of points to process at once during visualization (default: 128K)')
+    parser.add_argument('--chunk-size', type=int, default=None,
+                      help='Number of points to process at once during visualization (default: auto-optimize)')
     parser.add_argument('--log-file', type=str, default=None,
                       help='Path to the log file (default: log to console only)')
     
