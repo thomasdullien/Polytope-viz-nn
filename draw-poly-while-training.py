@@ -896,7 +896,7 @@ def full_pipeline(
         
         # Only visualize at save_interval or at the final epoch
         if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
-            epoch_str = "%04d" % (epoch + 1)
+            epoch_str = "%06d" % (epoch + 1)
             seed_str = str(random_seed) if random_seed is not None else "none"
             output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
             
@@ -1053,6 +1053,41 @@ try:
         args=args  # Pass the full args object to access optimizer settings
     )
     logger.info("=== Training completed successfully ===")
+    
+    # Create video from output images using ffmpeg
+    try:
+        seed_str = str(args.seed) if args.seed is not None else "none"
+        output_prefix = f"{os.path.basename(args.input)}_{network_shape_b64}_{seed_str}"
+        input_pattern = os.path.join(args.output_dir, f"{output_prefix}_epoch_*.png")
+        output_video = os.path.join(args.output_dir, f"{output_prefix}.mp4")
+        
+        logger.info(f"Creating video from image sequence: {output_video}")
+        
+        # Run ffmpeg command
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",  # -y to overwrite existing files
+            "-framerate", "24",
+            "-pattern_type", "glob",
+            "-i", input_pattern,
+            "-c:v", "libx264",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            output_video
+        ]
+        
+        import subprocess
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"Video created successfully: {output_video}")
+        else:
+            logger.error(f"ffmpeg failed with return code {result.returncode}")
+            logger.error(f"ffmpeg stderr: {result.stderr}")
+            
+    except Exception as video_error:
+        logger.error(f"Video creation failed: {str(video_error)}")
+        logger.exception("Video creation exception details:")
+        
 except Exception as e:
     logger.error(f"Training failed with error: {str(e)}")
     logger.exception("Exception details:")
