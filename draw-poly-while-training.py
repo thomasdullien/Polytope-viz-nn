@@ -17,6 +17,7 @@ from scipy.ndimage import gaussian_filter
 import logging
 from datetime import datetime
 import time
+import subprocess
 
 # Configure logging
 def setup_logger(log_file=None):
@@ -63,15 +64,18 @@ def setup_logger(log_file=None):
 logger = setup_logger()
 
 ### Neural Network Definition ###
-class ReLUNetwork(nn.Module):
+class PolytopeNet(nn.Module):
     def __init__(self, input_dim, layer_sizes, debug=False):
-        super(ReLUNetwork, self).__init__()
+        super(PolytopeNet, self).__init__()
         layers = []
         self.activation_layers = []
         self.debug = debug
 
+        # Save the random state
+        rng_state = torch.get_rng_state()
+        
         prev_dim = input_dim
-        for size in layer_sizes:
+        for i, size in enumerate(layer_sizes):
             # Create linear layer
             linear_layer = nn.Linear(prev_dim, size)
             # Initialize weights using He initialization
@@ -84,6 +88,9 @@ class ReLUNetwork(nn.Module):
             leaky_relu_layer = nn.LeakyReLU(negative_slope=0.01)
             layers.append(leaky_relu_layer)
             self.activation_layers.append(leaky_relu_layer)
+            
+            # Register a buffer for the random hash values for this layer's activations
+            self.register_buffer(f'hash_coeffs_{i}', torch.randint(1, 2**31-1, (size,), dtype=torch.int64))
             prev_dim = size
 
         # Create and initialize output layer
@@ -94,25 +101,36 @@ class ReLUNetwork(nn.Module):
         
         self.network = nn.Sequential(*layers)
 
+        # Restore the random state
+        torch.set_rng_state(rng_state)
+
     def forward(self, x):
-        activations = []
-        # Debug: Track the range of values at each layer
-        if self.debug:
-            logger.debug("\nLayer activations:")
+        # Unified path for both training and visualization
+        polytope_hash = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
         current = x
+        layer_idx = 0
+
         for i, layer in enumerate(self.network):
             current = layer(current)
             if isinstance(layer, nn.LeakyReLU):
-                # Count dead neurons (output = 0)
-                dead_neurons = (current == 0).float().mean().item()
-                if self.debug:
-                    logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
-                activations.append((current > 0).int())  # Activation tracking
-            elif isinstance(layer, nn.Linear) and self.debug:
-                logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+                # --- Polytope Hash Calculation ---
+                activation_pattern = (current > 0)
+                hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
+                polytope_hash += (activation_pattern * hash_coeffs).sum(dim=1)
+                layer_idx += 1
 
-        activation_pattern = torch.cat(activations, dim=1) if activations else None
-        return current, activation_pattern
+                # --- Debug Logic (guarded to prevent graph breaks) ---
+                if self.debug:
+                    # This block does not run when debug is False,
+                    # allowing torch.compile to ignore it.
+                    dead_neurons = (current == 0).float().mean().item()
+                    logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
+            
+            elif self.debug and isinstance(layer, nn.Linear):
+                 logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
+
+        return current, polytope_hash
+
 
 ### Data Preprocessing ###
 def preprocess_image(image_path):
@@ -321,7 +339,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Initialize arrays to collect results from all chunks
     all_outputs = []
-    all_activation_patterns = []
+    all_activation_hashes = []
     
     try:
         with torch.no_grad():
@@ -336,14 +354,14 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
                 chunk_inputs = torch.tensor(chunk_data[:, :-1], dtype=torch.float32).to(device)
                 
                 # Forward pass for this chunk
-                chunk_outputs, chunk_activation_patterns = network(chunk_inputs)
+                chunk_outputs, chunk_activation_hashes = network(chunk_inputs)
                 
                 # Collect results (move to CPU immediately to free GPU memory)
                 all_outputs.append(chunk_outputs.detach().cpu().numpy())
-                all_activation_patterns.append(chunk_activation_patterns.detach().cpu().numpy())
+                all_activation_hashes.append(chunk_activation_hashes.detach().cpu().numpy())
                 
                 # Explicitly free GPU memory
-                del chunk_inputs, chunk_outputs, chunk_activation_patterns
+                del chunk_inputs, chunk_outputs, chunk_activation_hashes
                 torch.cuda.empty_cache()
     
     except Exception as e:
@@ -354,7 +372,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     
     # Combine results from all chunks
     outputs = np.concatenate(all_outputs).flatten()
-    activation_patterns = np.concatenate(all_activation_patterns)
+    activation_hashes = np.concatenate(all_activation_hashes)
     
     # Debug network outputs
     logger.debug(f"Network outputs (len {len(outputs)}) range: min={outputs.min():.6f}, max={outputs.max():.6f}")
@@ -365,7 +383,7 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
         logger.warning("Network outputs are exactly constant (min == max). This indicates a serious problem with the network.")
         
         # Create a hash of the activation map for comparison
-        current_activation_hash = hash(activation_patterns.tobytes())
+        current_activation_hash = hash(activation_hashes.tobytes())
         
         # Check if this is the first constant output
         if constant_activation_map is None:
@@ -403,20 +421,15 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Filter valid data points
     valid_x = x_coords[valid_indices]
     valid_y = y_coords[valid_indices]
-    valid_activations = activation_patterns[valid_indices]
+    valid_hashes = activation_hashes[valid_indices]
     valid_outputs = outputs[valid_indices]
     
     # Process valid points vectorized
     points_processed = len(valid_x)
     logger.debug(f"Processing {points_processed} valid data points")
     
-    # Create hashes for activation patterns (this part must still be done per-point)
-    activation_hashes = np.zeros(points_processed, dtype=np.uint64)
-    for i in range(points_processed):
-        activation_hashes[i] = hash(tuple(valid_activations[i])) & 0xFFFFFFFFFFFFFFFF
-    
     # Assign to activation map
-    activation_map[valid_y, valid_x] = activation_hashes
+    activation_map[valid_y, valid_x] = valid_hashes
     
     # Scale and assign to prediction map (vectorized)
     scaled_outputs = np.clip(valid_outputs * 255, 0, 255)
@@ -480,48 +493,50 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Get epoch number from filename
     epoch_num = int(output_path.split('_epoch_')[1].split('.')[0])
     
-    # Create figure and display image
-    plt.figure(figsize=(18, 6))
-    plt.imshow(combined_image, interpolation='nearest', vmin=0, vmax=255)
+    # Add text using cv2
+    text_x = 2 * width + 10
+    text_y = 30
+    vertical_spacing = 30
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    font_color = (0, 0, 255)  # Red in BGR
+    thickness = 1
+
+    # List of text lines to add
+    text_lines = [
+        f'Epoch: {epoch_num}',
+        f'Train Loss: {train_loss:.4f}' if train_loss is not None else None,
+        f'Val Loss: {val_loss:.4f}' if val_loss is not None else None,
+        f'Shape: {network_shape_str}' if network_shape_str is not None else None,
+        f'Seed: {random_seed}' if random_seed is not None else None,
+        f'Points: {num_points}' if num_points is not None else None,
+        f'LR: {learning_rate}' if learning_rate is not None else None,
+    ]
     
-    # Add text using matplotlib with increased vertical spacing
-    # Position text at the start of the third image (2*width pixels from the left)
-    text_x = 2 * width + 10  # Start 10 pixels into the third image
-    text_y = 30  # Initial y position
-    vertical_spacing = 30  # Spacing between lines
-    plt.text(text_x, text_y, f'Epoch: {epoch_num}', color='red', fontsize=10)
-    if train_loss is not None:
-        plt.text(text_x, text_y + vertical_spacing, f'Train Loss: {train_loss:.4f}', color='red', fontsize=10)
-    if val_loss is not None:
-        plt.text(text_x, text_y + 2*vertical_spacing, f'Val Loss: {val_loss:.4f}', color='red', fontsize=10)
-    if network_shape_str is not None:
-        plt.text(text_x, text_y + 3*vertical_spacing, f'Shape: {network_shape_str}', color='red', fontsize=10)
-    if random_seed is not None:
-        plt.text(text_x, text_y + 4*vertical_spacing, f'Seed: {random_seed}', color='red', fontsize=10)
-    
-    # Add additional parameters
-    if num_points is not None:
-        plt.text(text_x, text_y + 5*vertical_spacing, f'Points: {num_points}', color='red', fontsize=10)
-    if learning_rate is not None:
-        plt.text(text_x, text_y + 6*vertical_spacing, f'LR: {learning_rate}', color='red', fontsize=10)
     if optimizer is not None:
         optimizer_text = f'Optimizer: {optimizer}'
         if optimizer == 'sgd_momentum' and momentum is not None:
             optimizer_text += f' (mom={momentum})'
-        plt.text(text_x, text_y + 7*vertical_spacing, optimizer_text, color='red', fontsize=10)
-    
+        text_lines.append(optimizer_text)
+
+    # Add text to the image
+    current_y = text_y
+    # Filter out None values from text_lines
+    for line in filter(None, text_lines):
+        cv2.putText(combined_image, line, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        current_y += vertical_spacing
+
     # Add warning if outputs are constant
     if is_constant:
         warning_text = f'WARNING: Constant output ({outputs.min():.6f})'
-        plt.text(text_x, text_y + 8*vertical_spacing, warning_text, color='red', fontsize=10, fontweight='bold')
+        cv2.putText(combined_image, warning_text, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        current_y += vertical_spacing
         if constant_output_counter > 1:
             counter_text = f'Constant counter: {constant_output_counter}/{CONSTANT_OUTPUT_THRESHOLD}'
-            plt.text(text_x, text_y + 9*vertical_spacing, counter_text, color='red', fontsize=10)
-    
-    plt.axis("off")
-    plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
-    plt.show()
-    plt.close()
+            cv2.putText(combined_image, counter_text, (text_x, current_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
+    # Save the image
+    cv2.imwrite(output_path, combined_image)
     
     # No need for timing here, it's done at a higher level
 
@@ -713,7 +728,7 @@ def full_pipeline(
     
     # Step 3: Initialize the network
     input_dim = 3 if is_video else 2
-    network = ReLUNetwork(input_dim, layer_sizes, debug=debug)
+    network = PolytopeNet(input_dim, layer_sizes, debug=debug)
     trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {trainable_params}")
     from torchinfo import summary
@@ -758,7 +773,7 @@ def full_pipeline(
         
         # Only visualize at save_interval or at the final epoch
         if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
-            epoch_str = "%04d" % (epoch + 1)
+            epoch_str = "%06d" % (epoch + 1)
             seed_str = str(random_seed) if random_seed is not None else "none"
             output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
             
@@ -801,6 +816,38 @@ def full_pipeline(
     # Step 6: Dump network weights
     weights_filename = os.path.join(output_dir, f"weights_{network_shape_b64}_{seed_str}.txt")
     dump_network_weights(network, weights_filename)
+
+    # Step 7: Generate video from PNGs
+    logger.info("Starting video generation...")
+    base_filename = f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}"
+    glob_pattern = os.path.join(output_dir, f"{base_filename}_epoch_*.png")
+    video_output_path = os.path.join(output_dir, f"{base_filename}.mp4")
+
+    ffmpeg_command = [
+        'ffmpeg',
+        '-y',  # Overwrite output file if it exists
+        '-framerate', '24',
+        '-pattern_type', 'glob',
+        '-i', glob_pattern,
+        '-c:v', 'libx264',
+        '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        video_output_path
+    ]
+
+    try:
+        # Using f-string for the command for clarity and safety with trusted inputs
+        logger.info(f"Running ffmpeg command: {' '.join(ffmpeg_command)}")
+        result = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        logger.info("ffmpeg stdout:\n" + result.stdout)
+        logger.info("ffmpeg stderr:\n" + result.stderr)
+        logger.info(f"Video generated successfully: {video_output_path}")
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please ensure ffmpeg is installed and in your system's PATH.")
+    except subprocess.CalledProcessError as e:
+        logger.error("ffmpeg command failed.")
+        logger.error("ffmpeg stdout:\n" + e.stdout)
+        logger.error("ffmpeg stderr:\n" + e.stderr)
 
 def parse_arguments():
     """Parse command line arguments using argparse."""
