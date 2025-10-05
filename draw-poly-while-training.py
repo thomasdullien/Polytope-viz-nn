@@ -174,13 +174,10 @@ def sample_data(data, train_size, val_size):
     return data[:train_size], data[train_size:train_size + val_size]
 
 
-def train_network(network, train_data, val_data, epochs, batch_size, learning_rate, output_dir, network_shape_b64, random_seed, network_shape_str, debug=False, args=None):
+def train_network(network, optimizer, train_data, val_data, epochs, batch_size, learning_rate, output_dir, network_shape_b64, random_seed, network_shape_str, debug=False, args=None):
     """Train the network and save visualizations."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)
-    
-    # Create optimizer based on command line arguments
-    optimizer = create_optimizer(network, args)
     
     # Convert data to tensors and move to device
     train_inputs = torch.tensor(train_data[:, :-1], dtype=torch.float32).to(device)
@@ -654,6 +651,101 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     
     logger.debug(f"Kernel smoothed image saved to: {output_path}")
 
+def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, random_seed, loss_history_data=None, network_param_history_data=None, args=None):
+    """Save a complete training checkpoint.
+
+    Args:
+        network: The neural network model
+        optimizer: The optimizer instance
+        epoch: Current epoch number
+        output_dir: Directory to save checkpoint
+        network_shape_b64: Base64 encoded network shape string
+        random_seed: Random seed used for training
+        loss_history_data: Loss history list for stagnation detection
+        network_param_history_data: Network parameter history dict
+        args: Command line arguments
+    """
+    seed_str = str(random_seed) if random_seed is not None else "none"
+    checkpoint_path = os.path.join(output_dir, f"checkpoint_{network_shape_b64}_{seed_str}_epoch_{epoch:06d}.pt")
+
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': network.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'optimizer_type': args.optimizer if args else 'adam',
+        'learning_rate': args.learning_rate if args else 0.001,
+        'momentum': args.momentum if args and hasattr(args, 'momentum') else None,
+        'pytorch_rng_state': torch.get_rng_state(),
+        'numpy_rng_state': np.random.get_state(),
+        'python_rng_state': random.getstate(),
+        'loss_history': loss_history_data if loss_history_data is not None else [],
+        'network_param_history': network_param_history_data if network_param_history_data is not None else {},
+        'network_shape_b64': network_shape_b64,
+        'random_seed': random_seed,
+        'args': {
+            'shape': args.shape if args else None,
+            'points': args.points if args else 5000,
+            'batch_size': args.batch_size if args else 1024,
+            'learning_rate': args.learning_rate if args else 0.001,
+            'optimizer': args.optimizer if args else 'adam',
+            'momentum': args.momentum if args and hasattr(args, 'momentum') else 0.9,
+        }
+    }
+
+    # Add CUDA RNG state if available
+    if torch.cuda.is_available():
+        checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state()
+        checkpoint['cuda_rng_state_all'] = torch.cuda.get_rng_state_all()
+
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Checkpoint saved: {checkpoint_path}")
+    return checkpoint_path
+
+def load_checkpoint(checkpoint_path, network, optimizer=None, restore_rng=True, restore_optimizer=True):
+    """Load a training checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        network: The neural network model to load weights into
+        optimizer: Optional optimizer to load state into
+        restore_rng: Whether to restore RNG states
+        restore_optimizer: Whether to restore optimizer state
+
+    Returns:
+        Dictionary containing checkpoint information
+    """
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Checkpoint file not found: {checkpoint_path}")
+
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path)
+
+    # Load model state
+    network.load_state_dict(checkpoint['model_state_dict'])
+    logger.info(f"Model state loaded from epoch {checkpoint['epoch']}")
+
+    # Load optimizer state if requested and provided
+    if restore_optimizer and optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        logger.info(f"Optimizer state restored ({checkpoint.get('optimizer_type', 'unknown')})")
+
+    # Restore RNG states if requested
+    if restore_rng:
+        if 'pytorch_rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['pytorch_rng_state'])
+        if 'numpy_rng_state' in checkpoint:
+            np.random.set_state(checkpoint['numpy_rng_state'])
+        if 'python_rng_state' in checkpoint:
+            random.setstate(checkpoint['python_rng_state'])
+        if torch.cuda.is_available():
+            if 'cuda_rng_state' in checkpoint:
+                torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+            if 'cuda_rng_state_all' in checkpoint:
+                torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state_all'])
+        logger.info("RNG states restored")
+
+    return checkpoint
+
 def dump_network_weights(network, filename):
     """Dump network weights to a file in a human-readable format."""
     with open(filename, 'w') as f:
@@ -661,7 +753,7 @@ def dump_network_weights(network, filename):
         linear_layers = [m for m in network.network if isinstance(m, nn.Linear)]
         f.write(f"Network architecture: {[l.in_features for l in linear_layers] + [linear_layers[-1].out_features]}\n")
         f.write(f"Number of layers: {len(linear_layers)}\n\n")
-        
+
         # Iterate through the sequential layers
         for i, module in enumerate(network.network):
             if isinstance(module, nn.Linear):
@@ -671,12 +763,12 @@ def dump_network_weights(network, filename):
                 f.write(f"  Weight mean: {module.weight.mean():.6f}, std: {module.weight.std():.6f}\n")
                 f.write(f"  Bias range: min={module.bias.min():.6f}, max={module.bias.max():.6f}\n")
                 f.write(f"  Bias mean: {module.bias.mean():.6f}, std: {module.bias.std():.6f}\n\n")
-                
+
                 # Write weight matrix
                 weight_matrix = module.weight.detach().cpu().numpy()
                 for row in weight_matrix:
                     f.write("    " + " ".join(f"{x:.6f}" for x in row) + "\n")
-                
+
                 # Write bias vector
                 f.write("\n  Bias vector:\n")
                 bias_vector = module.bias.detach().cpu().numpy()
@@ -686,13 +778,13 @@ def dump_network_weights(network, filename):
 
 ### Full Training and Visualization Pipeline ###
 def full_pipeline(
-    input_path, 
-    is_video=False, 
-    train_size=5000, 
-    val_size=1000, 
-    layer_sizes=[10, 10, 10, 10, 10, 10, 10, 10], 
-    epochs=10, 
-    batch_size=1024, 
+    input_path,
+    is_video=False,
+    train_size=5000,
+    val_size=1000,
+    layer_sizes=[10, 10, 10, 10, 10, 10, 10, 10],
+    epochs=10,
+    batch_size=1024,
     learning_rate=0.001,
     output_dir="results",
     random_seed=None,
@@ -701,10 +793,12 @@ def full_pipeline(
     debug=False,
     args=None
 ):
+    global loss_history, network_param_history
+
     # Start timing the entire training process
     training_start_time = time.time()
     logger.info(f"Starting full training pipeline at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Preprocess data
@@ -719,13 +813,21 @@ def full_pipeline(
     # Step 2: Sample training and validation data
     train_data, val_data = sample_data(data, train_size, val_size)
 
-    # Generate and save kernel smoothed image before training
+    # Handle checkpoint resumption
+    start_epoch = 0
+    checkpoint_data = None
+    if args and args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        # We'll load the checkpoint after creating the network
+
+    # Generate and save kernel smoothed image before training (skip if resuming)
     seed_str = str(random_seed) if random_seed is not None else "none"
     smoothed_image_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}-kernel-smoothed.png")
     sigma = args.smoothing_sigma if args and hasattr(args, 'smoothing_sigma') else 3.0
-    
-    save_kernel_smoothed_image(train_data, (height, width), smoothed_image_path, input_path, sigma=sigma)
-    
+
+    if not (args and args.resume):
+        save_kernel_smoothed_image(train_data, (height, width), smoothed_image_path, input_path, sigma=sigma)
+
     # Step 3: Initialize the network
     input_dim = 3 if is_video else 2
     network = PolytopeNet(input_dim, layer_sizes, debug=debug)
@@ -733,7 +835,7 @@ def full_pipeline(
     logger.info(f"Trainable parameters: {trainable_params}")
     from torchinfo import summary
     summary(network, input_size=(1024, 2))
-    
+
     # Apply torch.compile for acceleration if requested and available (PyTorch 2.0+)
     if args.use_compile and hasattr(torch, 'compile'):
         logger.info("Using torch.compile for network acceleration")
@@ -741,14 +843,47 @@ def full_pipeline(
     elif args.use_compile and not hasattr(torch, 'compile'):
         logger.warning("torch.compile requested but not available. Requires PyTorch 2.0+")
         logger.info("Continuing without compilation")
+
+    # Step 3b: Create optimizer (potentially overridden by checkpoint or resume args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    network.to(device)
+    optimizer = create_optimizer(network, args)
+
+    # Step 3c: Load checkpoint if resuming
+    if args and args.resume:
+        # Determine whether to restore optimizer state
+        restore_optimizer = (args.resume_optimizer is None)  # Only restore if not switching optimizers
+
+        checkpoint_data = load_checkpoint(args.resume, network, optimizer,
+                                         restore_rng=True, restore_optimizer=restore_optimizer)
+        start_epoch = checkpoint_data['epoch'] + 1  # Resume from next epoch
+
+        # Restore loss history and network param history for stagnation detection
+        if 'loss_history' in checkpoint_data:
+            loss_history = checkpoint_data['loss_history']
+        if 'network_param_history' in checkpoint_data:
+            network_param_history = checkpoint_data['network_param_history']
+
+        # Override optimizer if requested
+        if args.resume_optimizer:
+            logger.info(f"Switching optimizer from {checkpoint_data.get('optimizer_type', 'unknown')} to {args.resume_optimizer}")
+            optimizer = create_optimizer(network, args)  # Create new optimizer with new type
+
+        # Override learning rate if requested
+        if args.resume_lr:
+            logger.info(f"Changing learning rate from {checkpoint_data.get('learning_rate', 'unknown')} to {args.resume_lr}")
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.resume_lr
+
+        logger.info(f"Resuming training from epoch {start_epoch}")
     
     # Step 4: Train and visualize decision boundaries
     boundary_frames = []
     save_interval = args.save_interval if args and hasattr(args, 'save_interval') else 1
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    for epoch in range(epochs):
-        train_loss, val_loss = train_network(network, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args)
+    checkpoint_interval = args.checkpoint_interval if args and hasattr(args, 'checkpoint_interval') else None
+
+    for epoch in range(start_epoch, epochs):
+        train_loss, val_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args)
         logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
         # Check optimization problems on every epoch
@@ -807,17 +942,30 @@ def full_pipeline(
             logger.info(f"Visualization @ epoch {epoch + 1}: {duration:.2f}s")
             #boundary_frames.append(imageio.imread(output_path))
 
-    # Step 5: Save video if processing a video input
+        # Save checkpoint periodically if checkpoint_interval is set
+        if checkpoint_interval and (epoch + 1) % checkpoint_interval == 0:
+            save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64,
+                          random_seed, loss_history_data=loss_history,
+                          network_param_history_data=network_param_history, args=args)
+
+    # Step 5: Save final checkpoint
+    final_checkpoint_path = save_checkpoint(network, optimizer, epochs - 1, output_dir,
+                                           network_shape_b64, random_seed,
+                                           loss_history_data=loss_history,
+                                           network_param_history_data=network_param_history, args=args)
+    logger.info(f"Final checkpoint saved: {final_checkpoint_path}")
+
+    # Step 6: Save video if processing a video input
     if is_video:
         video_output_path = os.path.join(output_dir, "boundary_evolution.mp4")
         imageio.mimsave(video_output_path, boundary_frames, fps=5)
         logger.info(f"Boundary evolution video saved at: {video_output_path}")
 
-    # Step 6: Dump network weights
+    # Step 7: Dump network weights
     weights_filename = os.path.join(output_dir, f"weights_{network_shape_b64}_{seed_str}.txt")
     dump_network_weights(network, weights_filename)
 
-    # Step 7: Generate video from PNGs
+    # Step 8: Generate video from PNGs
     logger.info("Starting video generation...")
     base_filename = f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}"
     glob_pattern = os.path.join(output_dir, f"{base_filename}_epoch_*.png")
@@ -880,7 +1028,16 @@ def parse_arguments():
                       help='Number of points to process at once during visualization (default: 128K)')
     parser.add_argument('--log-file', type=str, default=None,
                       help='Path to the log file (default: log to console only)')
-    
+    parser.add_argument('--resume', type=str, default=None,
+                      help='Path to checkpoint file to resume training from')
+    parser.add_argument('--resume-optimizer', type=str, default=None,
+                      choices=['adam', 'sgd', 'sgd_momentum', 'rmsprop'],
+                      help='Override optimizer when resuming (default: use checkpoint optimizer)')
+    parser.add_argument('--resume-lr', type=float, default=None,
+                      help='Override learning rate when resuming (default: use checkpoint LR)')
+    parser.add_argument('--checkpoint-interval', type=int, default=None,
+                      help='Save checkpoint every N epochs (default: only save final checkpoint)')
+
     args = parser.parse_args()
     
     # Set up logging with file if specified
@@ -895,7 +1052,7 @@ def parse_arguments():
             handler.setLevel(logging.DEBUG)
     
     # Create a string that includes all relevant parameters for the filename
-    params_str = f"{args.shape}_{args.points}_{args.learning_rate}_{args.optimizer}"
+    params_str = f"{args.shape}_{args.points}_{args.batch_size}_{args.learning_rate}_{args.optimizer}"
     if args.optimizer == 'sgd_momentum':
         params_str += f"_mom{args.momentum}"
     
@@ -905,17 +1062,25 @@ def parse_arguments():
     return args, network_shape_b64
 
 def create_optimizer(network, args):
-    """Create the specified optimizer with appropriate parameters."""
-    if args.optimizer == 'adam':
-        return optim.Adam(network.parameters(), lr=args.learning_rate)
-    elif args.optimizer == 'sgd':
-        return optim.SGD(network.parameters(), lr=args.learning_rate)
-    elif args.optimizer == 'sgd_momentum':
-        return optim.SGD(network.parameters(), lr=args.learning_rate, momentum=args.momentum)
-    elif args.optimizer == 'rmsprop':
-        return optim.RMSprop(network.parameters(), lr=args.learning_rate)
+    """Create the specified optimizer with appropriate parameters.
+
+    If resuming with a different optimizer, uses resume_optimizer instead of optimizer.
+    """
+    # Use resume_optimizer if specified (for switching optimizers), otherwise use optimizer
+    optimizer_type = args.resume_optimizer if hasattr(args, 'resume_optimizer') and args.resume_optimizer else args.optimizer
+    learning_rate = args.resume_lr if hasattr(args, 'resume_lr') and args.resume_lr else args.learning_rate
+
+    if optimizer_type == 'adam':
+        return optim.Adam(network.parameters(), lr=learning_rate)
+    elif optimizer_type == 'sgd':
+        return optim.SGD(network.parameters(), lr=learning_rate)
+    elif optimizer_type == 'sgd_momentum':
+        momentum = args.momentum if hasattr(args, 'momentum') else 0.9
+        return optim.SGD(network.parameters(), lr=learning_rate, momentum=momentum)
+    elif optimizer_type == 'rmsprop':
+        return optim.RMSprop(network.parameters(), lr=learning_rate)
     else:
-        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+        raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
 # Parse arguments
 args, network_shape_b64 = parse_arguments()

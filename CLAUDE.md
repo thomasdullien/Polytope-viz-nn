@@ -11,6 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Configure logging: Add `--log-file <path>` to save logs to a file (default: console only)
 - Enable debug logging: Add `--debug` flag to increase logging verbosity
 
+### Resume Training
+- Resume from checkpoint: `--resume <checkpoint_path>` to continue training from a saved checkpoint
+- Save periodic checkpoints: `--checkpoint-interval <N>` to save checkpoints every N epochs
+- Switch optimizer when resuming: `--resume-optimizer <adam|sgd|sgd_momentum|rmsprop>` to change optimizer
+- Change learning rate when resuming: `--resume-lr <rate>` to override the learning rate
+- Example: Resume training and switch from ADAM to SGD:
+  ```bash
+  python draw-poly-while-training.py --input centered_ring.png --shape "[10]*8" --epochs 200 \
+    --resume results/checkpoint_*.pt --resume-optimizer sgd --resume-lr 0.01
+  ```
+
 ## Logging Features
 - Timestamped logs with proper log levels (INFO, WARNING, ERROR, DEBUG)
 - Performance timing for visualization steps
