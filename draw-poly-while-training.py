@@ -658,15 +658,19 @@ def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, ra
         network: The neural network model
         optimizer: The optimizer instance
         epoch: Current epoch number
-        output_dir: Directory to save checkpoint
+        output_dir: Directory to save checkpoint (used as default if checkpoint_dir not specified)
         network_shape_b64: Base64 encoded network shape string
         random_seed: Random seed used for training
         loss_history_data: Loss history list for stagnation detection
         network_param_history_data: Network parameter history dict
         args: Command line arguments
     """
+    # Use checkpoint_dir if specified, otherwise use output_dir
+    checkpoint_dir = args.checkpoint_dir if args and hasattr(args, 'checkpoint_dir') and args.checkpoint_dir else output_dir
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     seed_str = str(random_seed) if random_seed is not None else "none"
-    checkpoint_path = os.path.join(output_dir, f"checkpoint_{network_shape_b64}_{seed_str}_epoch_{epoch:06d}.pt")
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{network_shape_b64}_{seed_str}_epoch_{epoch:06d}.pt")
 
     checkpoint = {
         'epoch': epoch,
@@ -787,6 +791,7 @@ def full_pipeline(
     batch_size=1024,
     learning_rate=0.001,
     output_dir="results",
+    snapshot_dir="snapshots",
     random_seed=None,
     network_shape_b64=None,
     network_shape_str=None,
@@ -800,6 +805,7 @@ def full_pipeline(
     logger.info(f"Starting full training pipeline at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(snapshot_dir, exist_ok=True)
 
     # Step 1: Preprocess data
     if is_video:
@@ -918,7 +924,7 @@ def full_pipeline(
         if (epoch + 1) % save_interval == 0 or epoch == epochs - 1:
             epoch_str = "%06d" % (epoch + 1)
             seed_str = str(random_seed) if random_seed is not None else "none"
-            output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
+            output_path = os.path.join(snapshot_dir, f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}_epoch_{epoch_str}.png")
             
             # Time the visualization step without extra logs
             start_time = time.time()
@@ -976,7 +982,7 @@ def full_pipeline(
     # Step 8: Generate video from PNGs
     logger.info("Starting video generation...")
     base_filename = f"{os.path.basename(input_path)}_{network_shape_b64}_{seed_str}"
-    glob_pattern = os.path.join(output_dir, f"{base_filename}_epoch_*.png")
+    glob_pattern = os.path.join(snapshot_dir, f"{base_filename}_epoch_*.png")
     video_output_path = os.path.join(output_dir, f"{base_filename}.mp4")
 
     ffmpeg_command = [
@@ -1021,6 +1027,7 @@ def parse_arguments():
     parser.add_argument('--batch-size', '-b', type=int, default=1024, help='Batch size for training (default: 1024)')
     parser.add_argument('--learning-rate', '-l', type=float, default=0.001, help='Learning rate (default: 0.001)')
     parser.add_argument('--output-dir', '-o', default='results', help='Output directory for results (default: results)')
+    parser.add_argument('--snapshot-dir', default='snapshots', help='Directory for epoch snapshots (default: snapshots)')
     parser.add_argument('--optimizer', type=str, default='adam', 
                       choices=['adam', 'sgd', 'sgd_momentum', 'rmsprop'],
                       help='Optimizer to use (default: adam)')
@@ -1045,6 +1052,8 @@ def parse_arguments():
                       help='Override learning rate when resuming (default: use checkpoint LR)')
     parser.add_argument('--checkpoint-interval', type=int, default=None,
                       help='Save checkpoint every N epochs (default: only save final checkpoint)')
+    parser.add_argument('--checkpoint-dir', type=str, default=None,
+                      help='Directory to save checkpoints (default: same as output-dir)')
 
     args = parser.parse_args()
     
@@ -1128,6 +1137,7 @@ try:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         output_dir=args.output_dir,
+        snapshot_dir=args.snapshot_dir,
         random_seed=args.seed,
         network_shape_b64=network_shape_b64,
         network_shape_str=args.shape,
