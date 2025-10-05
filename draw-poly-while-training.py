@@ -718,7 +718,7 @@ def load_checkpoint(checkpoint_path, network, optimizer=None, restore_rng=True, 
         raise ValueError(f"Checkpoint file not found: {checkpoint_path}")
 
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
 
     # Load model state
     network.load_state_dict(checkpoint['model_state_dict'])
@@ -850,6 +850,11 @@ def full_pipeline(
     optimizer = create_optimizer(network, args)
 
     # Step 3c: Load checkpoint if resuming
+    # Track current optimizer type and learning rate for visualization
+    current_optimizer_type = args.optimizer
+    current_learning_rate = args.learning_rate
+    current_momentum = args.momentum if args.optimizer == 'sgd_momentum' else None
+
     if args and args.resume:
         # Determine whether to restore optimizer state
         restore_optimizer = (args.resume_optimizer is None)  # Only restore if not switching optimizers
@@ -868,12 +873,15 @@ def full_pipeline(
         if args.resume_optimizer:
             logger.info(f"Switching optimizer from {checkpoint_data.get('optimizer_type', 'unknown')} to {args.resume_optimizer}")
             optimizer = create_optimizer(network, args)  # Create new optimizer with new type
+            current_optimizer_type = args.resume_optimizer
+            current_momentum = args.momentum if args.resume_optimizer == 'sgd_momentum' else None
 
         # Override learning rate if requested
         if args.resume_lr:
             logger.info(f"Changing learning rate from {checkpoint_data.get('learning_rate', 'unknown')} to {args.resume_lr}")
             for param_group in optimizer.param_groups:
                 param_group['lr'] = args.resume_lr
+            current_learning_rate = args.resume_lr
 
         logger.info(f"Resuming training from epoch {start_epoch}")
     
@@ -928,9 +936,9 @@ def full_pipeline(
               random_seed=random_seed,
               epoch=epoch,
               num_points=args.points if args else None,
-              learning_rate=args.learning_rate if args else None,
-              optimizer=args.optimizer if args else None,
-              momentum=args.momentum if args and args.optimizer == 'sgd_momentum' else None,
+              learning_rate=current_learning_rate if args else None,
+              optimizer=current_optimizer_type if args else None,
+              momentum=current_momentum,
               chunk_size=args.chunk_size if args and hasattr(args, 'chunk_size') else None
             )
             
