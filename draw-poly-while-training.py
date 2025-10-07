@@ -63,6 +63,206 @@ def setup_logger(log_file=None):
 # Initialize logger without file logging yet - we'll update it in parse_arguments()
 logger = setup_logger()
 
+### Kolmogorov Regularization Utilities ###
+
+def quantize_weights(weights, num_bins, weight_range):
+    """Quantize continuous weight values into discrete bins.
+
+    Args:
+        weights: Tensor of weight values
+        num_bins: Number of bins for quantization
+        weight_range: Tuple of (min_val, max_val) for clipping
+
+    Returns:
+        Tensor of bin indices (long type for cross-entropy)
+    """
+    min_val, max_val = weight_range
+    # Clip weights to range
+    clipped = torch.clamp(weights, min_val, max_val)
+    # Normalize to [0, 1]
+    normalized = (clipped - min_val) / (max_val - min_val)
+    # Convert to bin indices [0, num_bins-1]
+    bins = (normalized * (num_bins - 1)).long()
+    return bins
+
+
+def gaussian_nll_loss(actual, predicted_mean, predicted_log_var):
+    """Compute Gaussian negative log-likelihood loss.
+
+    This measures how likely the actual weights are under a predicted
+    Gaussian distribution, which is equivalent to the encoding cost.
+
+    Args:
+        actual: Actual weight values
+        predicted_mean: Predicted mean of Gaussian
+        predicted_log_var: Predicted log variance
+
+    Returns:
+        Scalar loss value
+    """
+    # NLL = 0.5 * (log(2*pi*var) + (x - mu)^2 / var)
+    # Using log_var for numerical stability
+    var = torch.exp(predicted_log_var)
+    loss = 0.5 * (predicted_log_var + ((actual - predicted_mean) ** 2) / var + math.log(2 * math.pi))
+    return loss.mean()
+
+
+def laplacian_nll_loss(actual, predicted_location, predicted_log_scale):
+    """Compute Laplacian negative log-likelihood loss.
+
+    Laplacian distribution is appropriate for sparse/peaked weight distributions.
+
+    Args:
+        actual: Actual weight values
+        predicted_location: Predicted location parameter (like mean)
+        predicted_log_scale: Predicted log scale parameter
+
+    Returns:
+        Scalar loss value
+    """
+    # NLL = log(2*scale) + |x - location| / scale
+    scale = torch.exp(predicted_log_scale)
+    loss = predicted_log_scale + math.log(2) + torch.abs(actual - predicted_location) / scale
+    return loss.mean()
+
+
+### Weight Predictor Network for Kolmogorov Regularization ###
+
+class WeightPredictorNetwork(nn.Module):
+    """A small network that predicts weights of the main network.
+
+    This network takes normalized weight indices (layer, neuron, weight_position)
+    and predicts the actual weight value. The prediction error serves as a proxy
+    for Kolmogorov complexity - more predictable weights have lower complexity.
+
+    Supports multiple loss types:
+    - 'mse': Mean squared error (simple regression)
+    - 'cross_entropy': Quantized cross-entropy (information-theoretic)
+    - 'gaussian_nll': Gaussian negative log-likelihood
+    - 'laplacian_nll': Laplacian negative log-likelihood
+    """
+
+    def __init__(self, layer_sizes, loss_type='mse', num_bins=256, debug=False):
+        """Initialize weight predictor network.
+
+        Args:
+            layer_sizes: List of hidden layer sizes
+            loss_type: Type of loss function to use
+            num_bins: Number of bins for cross_entropy quantization
+            debug: Enable debug logging
+        """
+        super(WeightPredictorNetwork, self).__init__()
+        self.debug = debug
+        self.loss_type = loss_type
+        self.num_bins = num_bins
+
+        layers = []
+
+        # Input: 3 features (layer_id_norm, neuron_id_norm, weight_position_norm)
+        input_dim = 3
+        prev_dim = input_dim
+
+        # Hidden layers
+        for i, size in enumerate(layer_sizes):
+            linear_layer = nn.Linear(prev_dim, size)
+            nn.init.kaiming_normal_(linear_layer.weight, mode='fan_in', nonlinearity='leaky_relu')
+            nn.init.constant_(linear_layer.bias, 0.1)
+            layers.append(linear_layer)
+            layers.append(nn.LeakyReLU(negative_slope=0.01))
+            prev_dim = size
+
+        self.hidden_layers = nn.Sequential(*layers)
+
+        # Output layer depends on loss type
+        if loss_type == 'cross_entropy':
+            # Output: probability distribution over bins
+            self.output_layer = nn.Linear(prev_dim, num_bins)
+            # LogSoftmax for numerical stability with NLLLoss
+        elif loss_type in ['gaussian_nll', 'laplacian_nll']:
+            # Output: [location/mean, log_scale/log_variance]
+            self.output_layer = nn.Linear(prev_dim, 2)
+        else:  # mse
+            # Output: single predicted value
+            self.output_layer = nn.Linear(prev_dim, 1)
+
+        # Initialize output layer
+        nn.init.kaiming_normal_(self.output_layer.weight, mode='fan_in', nonlinearity='leaky_relu')
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
+    def forward(self, weight_positions):
+        """Predict weight values or distributions from normalized positions.
+
+        Args:
+            weight_positions: Tensor of shape (N, 3) with normalized indices
+
+        Returns:
+            Predictions (format depends on loss_type):
+            - mse: (N, 1) predicted values
+            - cross_entropy: (N, num_bins) log-probabilities
+            - gaussian_nll/laplacian_nll: (N, 2) distribution parameters
+        """
+        hidden = self.hidden_layers(weight_positions)
+        output = self.output_layer(hidden)
+
+        if self.loss_type == 'cross_entropy':
+            # Apply log_softmax for cross-entropy
+            return F.log_softmax(output, dim=-1)
+        else:
+            return output
+
+
+def compute_kolmogorov_loss(weight_predictor, main_network, device, weight_range=(-3.0, 3.0)):
+    """Compute the Kolmogorov complexity proxy loss.
+
+    This measures how well the weight predictor can predict the main network's
+    weights, serving as a proxy for the compressibility/complexity of the weights.
+
+    Args:
+        weight_predictor: WeightPredictorNetwork instance
+        main_network: Main PolytopeNet instance
+        device: torch device for computation
+        weight_range: Tuple of (min_val, max_val) for weight clipping in cross_entropy
+
+    Returns:
+        Scalar loss value
+    """
+    # Get weight enumeration from main network (already on correct device)
+    weight_positions, actual_weights = main_network.get_weight_enumeration()
+
+    # Ensure tensors are on the correct device (should be no-op if already there)
+    if weight_positions.device != device:
+        weight_positions = weight_positions.to(device)
+    if actual_weights.device != device:
+        actual_weights = actual_weights.to(device)
+
+    # Get predictions from weight predictor
+    predictions = weight_predictor(weight_positions)
+
+    loss_type = weight_predictor.loss_type
+
+    if loss_type == 'mse':
+        return F.mse_loss(predictions.squeeze(), actual_weights)
+
+    elif loss_type == 'cross_entropy':
+        # Quantize actual weights into bins
+        weight_bins = quantize_weights(actual_weights, weight_predictor.num_bins, weight_range)
+        # predictions are log-probabilities (from LogSoftmax)
+        return F.nll_loss(predictions, weight_bins)
+
+    elif loss_type == 'gaussian_nll':
+        predicted_mean = predictions[:, 0]
+        predicted_log_var = predictions[:, 1]
+        return gaussian_nll_loss(actual_weights, predicted_mean, predicted_log_var)
+
+    elif loss_type == 'laplacian_nll':
+        predicted_location = predictions[:, 0]
+        predicted_log_scale = predictions[:, 1]
+        return laplacian_nll_loss(actual_weights, predicted_location, predicted_log_scale)
+
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+
 ### Neural Network Definition ###
 class PolytopeNet(nn.Module):
     def __init__(self, input_dim, layer_sizes, debug=False):
@@ -131,6 +331,83 @@ class PolytopeNet(nn.Module):
 
         return current, polytope_hash
 
+    def get_weight_enumeration(self):
+        """Enumerate all weights in the network with normalized positions.
+
+        Returns:
+            Tuple of (weight_positions, actual_weights) where:
+            - weight_positions: Tensor of shape (N, 3) with normalized (layer, neuron, position)
+            - actual_weights: Tensor of shape (N,) with actual weight values
+        """
+        # Check if we have cached position indices
+        if not hasattr(self, '_weight_position_cache'):
+            self._build_weight_position_cache()
+
+        # Extract actual weight values efficiently (stays on GPU)
+        actual_weights = []
+        for module in self.network:
+            if isinstance(module, nn.Linear):
+                # Flatten weight matrix and bias, keep on device
+                actual_weights.append(module.weight.flatten())
+                actual_weights.append(module.bias)
+
+        # Concatenate all weights into single tensor (stays on GPU)
+        actual_weights = torch.cat(actual_weights)
+
+        return self._weight_position_cache.clone(), actual_weights
+
+    def _build_weight_position_cache(self):
+        """Build cached weight position indices (called once)."""
+        weight_positions = []
+
+        # Count total layers for normalization
+        linear_layers = [m for m in self.network if isinstance(m, nn.Linear)]
+        num_layers = len(linear_layers)
+
+        layer_counter = 0
+        for module in self.network:
+            if isinstance(module, nn.Linear):
+                # Normalize layer index
+                layer_id_norm = layer_counter / max(num_layers - 1, 1)
+                device = module.weight.device
+
+                # Process weight matrix - vectorized
+                out_features, in_features = module.weight.shape
+
+                # Create meshgrid for neuron and weight indices
+                neuron_indices = torch.arange(out_features, device=device, dtype=torch.float32)
+                weight_indices = torch.arange(in_features, device=device, dtype=torch.float32)
+
+                # Normalize indices
+                neuron_norm = neuron_indices / max(out_features - 1, 1)
+                weight_norm = weight_indices / max(in_features - 1, 1)
+
+                # Create all combinations efficiently
+                neuron_grid, weight_grid = torch.meshgrid(neuron_norm, weight_norm, indexing='ij')
+                layer_grid = torch.full_like(neuron_grid, layer_id_norm)
+
+                # Stack into (N, 3) tensor
+                positions = torch.stack([
+                    layer_grid.flatten(),
+                    neuron_grid.flatten(),
+                    weight_grid.flatten()
+                ], dim=1)
+                weight_positions.append(positions)
+
+                # Process bias vector - vectorized
+                bias_positions = torch.stack([
+                    torch.full((out_features,), layer_id_norm, device=device),
+                    neuron_norm,
+                    torch.ones(out_features, device=device)  # Bias gets position 1.0
+                ], dim=1)
+                weight_positions.append(bias_positions)
+
+                layer_counter += 1
+
+        # Concatenate all positions and cache
+        self._weight_position_cache = torch.cat(weight_positions, dim=0)
+        logger.debug(f"Built weight position cache: {self._weight_position_cache.shape[0]} weights")
+
 
 ### Data Preprocessing ###
 def preprocess_image(image_path):
@@ -174,54 +451,100 @@ def sample_data(data, train_size, val_size):
     return data[:train_size], data[train_size:train_size + val_size]
 
 
-def train_network(network, optimizer, train_data, val_data, epochs, batch_size, learning_rate, output_dir, network_shape_b64, random_seed, network_shape_str, debug=False, args=None):
-    """Train the network and save visualizations."""
+def train_network(network, optimizer, train_data, val_data, epochs, batch_size, learning_rate, output_dir, network_shape_b64, random_seed, network_shape_str, debug=False, args=None, weight_predictor=None, weight_predictor_optimizer=None):
+    """Train the network and save visualizations.
+
+    Args:
+        weight_predictor: Optional WeightPredictorNetwork for Kolmogorov regularization
+        weight_predictor_optimizer: Optional optimizer for weight predictor
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)
-    
+
+    # Move weight predictor to device if provided
+    if weight_predictor is not None:
+        weight_predictor.to(device)
+
     # Convert data to tensors and move to device
     train_inputs = torch.tensor(train_data[:, :-1], dtype=torch.float32).to(device)
     train_targets = torch.tensor(train_data[:, -1], dtype=torch.float32).unsqueeze(1).to(device)
     val_inputs = torch.tensor(val_data[:, :-1], dtype=torch.float32).to(device)
     val_targets = torch.tensor(val_data[:, -1], dtype=torch.float32).unsqueeze(1).to(device)
-    
+
     # Create data loaders
     train_dataset = TensorDataset(train_inputs, train_targets)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
+
     # Define loss function
     criterion = nn.MSELoss()
-    
+
+    # Get Kolmogorov regularization parameters
+    kolmogorov_weight = args.kolmogorov_weight if args and hasattr(args, 'kolmogorov_weight') else 0.0
+    use_kolmogorov = weight_predictor is not None and kolmogorov_weight > 0.0
+
     # Training loop
     for epoch in range(epochs):
         network.train()
+        if weight_predictor is not None:
+            weight_predictor.train()
+
         total_loss = 0
+        total_task_loss = 0
+        total_kolmogorov_loss = 0
         num_batches = 0
-        
+
         for batch_inputs, batch_targets in train_loader:
             optimizer.zero_grad()
+            if weight_predictor_optimizer is not None:
+                weight_predictor_optimizer.zero_grad()
+
+            # Forward pass for main task
             outputs, _ = network(batch_inputs)
-            loss = criterion(outputs, batch_targets)
+            task_loss = criterion(outputs, batch_targets)
+
+            # Compute combined loss
+            if use_kolmogorov:
+                # Compute Kolmogorov regularization loss
+                weight_range = (args.kolmogorov_weight_min, args.kolmogorov_weight_max) if args and hasattr(args, 'kolmogorov_weight_min') else (-3.0, 3.0)
+                kolmogorov_loss = compute_kolmogorov_loss(weight_predictor, network, device, weight_range)
+                loss = task_loss + kolmogorov_weight * kolmogorov_loss
+                total_kolmogorov_loss += kolmogorov_loss.item()
+            else:
+                loss = task_loss
+
+            # Backward pass
             loss.backward()
             optimizer.step()
+            if weight_predictor_optimizer is not None:
+                weight_predictor_optimizer.step()
+
             total_loss += loss.item()
+            total_task_loss += task_loss.item()
             num_batches += 1
-        
+
         avg_train_loss = total_loss / num_batches
-        
+        avg_task_loss = total_task_loss / num_batches
+        avg_kolmogorov_loss = total_kolmogorov_loss / num_batches if use_kolmogorov else 0.0
+
         # Validation
         network.eval()
+        if weight_predictor is not None:
+            weight_predictor.eval()
+
         with torch.no_grad():
             val_outputs, _ = network(val_inputs)
             val_loss = criterion(val_outputs, val_targets).item()
-        
+
         if debug:
             logger.debug(f"Epoch {epoch+1}/{epochs}")
             logger.debug(f"Training Loss: {avg_train_loss:.6f}")
+            logger.debug(f"Task Loss: {avg_task_loss:.6f}")
+            if use_kolmogorov:
+                logger.debug(f"Kolmogorov Loss: {avg_kolmogorov_loss:.6f}")
             logger.debug(f"Validation Loss: {val_loss:.6f}")
-    
-    # Return the final loss values
-    return avg_train_loss, val_loss
+
+    # Return the final loss values (including kolmogorov loss for logging)
+    return avg_task_loss, val_loss, avg_kolmogorov_loss if use_kolmogorov else 0.0
 
 # Global variables to track constant outputs
 constant_activation_map = None
@@ -493,9 +816,9 @@ def visualize_decision_boundary_with_predictions(network, data, train_data, val_
     # Add text using cv2
     text_x = 2 * width + 10
     text_y = 30
-    vertical_spacing = 30
+    vertical_spacing = 35
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.7
+    font_scale = 0.9
     font_color = (0, 0, 255)  # Red in BGR
     thickness = 1
 
@@ -651,7 +974,7 @@ def save_kernel_smoothed_image(train_data, image_shape, output_path, original_im
     
     logger.debug(f"Kernel smoothed image saved to: {output_path}")
 
-def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, random_seed, loss_history_data=None, network_param_history_data=None, args=None):
+def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, random_seed, loss_history_data=None, network_param_history_data=None, args=None, weight_predictor=None, weight_predictor_optimizer=None):
     """Save a complete training checkpoint.
 
     Args:
@@ -664,6 +987,8 @@ def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, ra
         loss_history_data: Loss history list for stagnation detection
         network_param_history_data: Network parameter history dict
         args: Command line arguments
+        weight_predictor: Optional weight predictor network
+        weight_predictor_optimizer: Optional weight predictor optimizer
     """
     # Use checkpoint_dir if specified, otherwise use output_dir
     checkpoint_dir = args.checkpoint_dir if args and hasattr(args, 'checkpoint_dir') and args.checkpoint_dir else output_dir
@@ -695,6 +1020,18 @@ def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, ra
             'momentum': args.momentum if args and hasattr(args, 'momentum') else 0.9,
         }
     }
+
+    # Save weight predictor state if present
+    if weight_predictor is not None:
+        checkpoint['weight_predictor_state_dict'] = weight_predictor.state_dict()
+        checkpoint['weight_predictor_loss_type'] = weight_predictor.loss_type
+        checkpoint['weight_predictor_num_bins'] = weight_predictor.num_bins
+        if weight_predictor_optimizer is not None:
+            checkpoint['weight_predictor_optimizer_state_dict'] = weight_predictor_optimizer.state_dict()
+        if args:
+            checkpoint['kolmogorov_shape'] = args.kolmogorov_shape
+            checkpoint['kolmogorov_weight'] = args.kolmogorov_weight
+            checkpoint['kolmogorov_lr'] = args.kolmogorov_lr if hasattr(args, 'kolmogorov_lr') else None
 
     # Add CUDA RNG state if available
     if torch.cuda.is_available():
@@ -855,7 +1192,37 @@ def full_pipeline(
     network.to(device)
     optimizer = create_optimizer(network, args)
 
-    # Step 3c: Load checkpoint if resuming
+    # Step 3c: Create weight predictor network if Kolmogorov regularization is enabled
+    weight_predictor = None
+    weight_predictor_optimizer = None
+    if args and hasattr(args, 'kolmogorov_shape') and args.kolmogorov_shape and args.kolmogorov_weight > 0.0:
+        logger.info("Creating weight predictor network for Kolmogorov regularization")
+        kolmogorov_layer_sizes = eval(args.kolmogorov_shape)
+        loss_type = args.kolmogorov_loss_type if hasattr(args, 'kolmogorov_loss_type') else 'mse'
+        num_bins = args.kolmogorov_bins if hasattr(args, 'kolmogorov_bins') else 256
+        weight_predictor = WeightPredictorNetwork(kolmogorov_layer_sizes, loss_type=loss_type, num_bins=num_bins, debug=debug)
+        weight_predictor.to(device)
+
+        # Create optimizer for weight predictor (use same type as main network)
+        weight_predictor_lr = args.kolmogorov_lr if hasattr(args, 'kolmogorov_lr') and args.kolmogorov_lr else learning_rate
+        if args.optimizer == 'adam':
+            weight_predictor_optimizer = optim.Adam(weight_predictor.parameters(), lr=weight_predictor_lr)
+        elif args.optimizer == 'sgd':
+            weight_predictor_optimizer = optim.SGD(weight_predictor.parameters(), lr=weight_predictor_lr)
+        elif args.optimizer == 'sgd_momentum':
+            weight_predictor_optimizer = optim.SGD(weight_predictor.parameters(), lr=weight_predictor_lr, momentum=args.momentum)
+        elif args.optimizer == 'rmsprop':
+            weight_predictor_optimizer = optim.RMSprop(weight_predictor.parameters(), lr=weight_predictor_lr)
+
+        # Count parameters
+        wp_params = sum(p.numel() for p in weight_predictor.parameters() if p.requires_grad)
+        logger.info(f"Weight predictor parameters: {wp_params}")
+        logger.info(f"Kolmogorov loss type: {loss_type}")
+        logger.info(f"Kolmogorov weight: {args.kolmogorov_weight}")
+        if loss_type == 'cross_entropy':
+            logger.info(f"Kolmogorov bins: {num_bins}")
+
+    # Step 3d: Load checkpoint if resuming
     # Track current optimizer type and learning rate for visualization
     current_optimizer_type = args.optimizer
     current_learning_rate = args.learning_rate
@@ -897,8 +1264,11 @@ def full_pipeline(
     checkpoint_interval = args.checkpoint_interval if args and hasattr(args, 'checkpoint_interval') else None
 
     for epoch in range(start_epoch, epochs):
-        train_loss, val_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args)
-        logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        train_loss, val_loss, kolmogorov_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args, weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
+        if weight_predictor is not None and args.kolmogorov_weight > 0.0:
+            logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Kolmogorov Loss: {kolmogorov_loss:.6f}")
+        else:
+            logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
         # Check optimization problems on every epoch
         network.eval()
@@ -960,13 +1330,15 @@ def full_pipeline(
         if checkpoint_interval and (epoch + 1) % checkpoint_interval == 0:
             save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64,
                           random_seed, loss_history_data=loss_history,
-                          network_param_history_data=network_param_history, args=args)
+                          network_param_history_data=network_param_history, args=args,
+                          weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
 
     # Step 5: Save final checkpoint
     final_checkpoint_path = save_checkpoint(network, optimizer, epochs - 1, output_dir,
                                            network_shape_b64, random_seed,
                                            loss_history_data=loss_history,
-                                           network_param_history_data=network_param_history, args=args)
+                                           network_param_history_data=network_param_history, args=args,
+                                           weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
     logger.info(f"Final checkpoint saved: {final_checkpoint_path}")
 
     # Step 6: Save video if processing a video input
@@ -987,6 +1359,7 @@ def full_pipeline(
 
     ffmpeg_command = [
         'ffmpeg',
+        '-loglevel', 'quiet',
         '-y',  # Overwrite output file if it exists
         '-framerate', '24',
         '-pattern_type', 'glob',
@@ -1054,6 +1427,23 @@ def parse_arguments():
                       help='Save checkpoint every N epochs (default: only save final checkpoint)')
     parser.add_argument('--checkpoint-dir', type=str, default=None,
                       help='Directory to save checkpoints (default: same as output-dir)')
+
+    # Kolmogorov regularization arguments
+    parser.add_argument('--kolmogorov-shape', type=str, default=None,
+                      help='Weight predictor network shape (e.g., "[5, 5]"). If not specified, no regularization.')
+    parser.add_argument('--kolmogorov-weight', type=float, default=0.0,
+                      help='Weight for Kolmogorov regularization loss (default: 0.0, disabled)')
+    parser.add_argument('--kolmogorov-loss-type', type=str, default='cross_entropy',
+                      choices=['mse', 'cross_entropy', 'gaussian_nll', 'laplacian_nll'],
+                      help='Loss function for weight prediction (default: cross_entropy)')
+    parser.add_argument('--kolmogorov-bins', type=int, default=256,
+                      help='Number of bins for cross_entropy quantization (default: 256)')
+    parser.add_argument('--kolmogorov-weight-min', type=float, default=-3.0,
+                      help='Minimum weight value for quantization (default: -3.0)')
+    parser.add_argument('--kolmogorov-weight-max', type=float, default=3.0,
+                      help='Maximum weight value for quantization (default: 3.0)')
+    parser.add_argument('--kolmogorov-lr', type=float, default=None,
+                      help='Learning rate for weight predictor (default: same as main network)')
 
     args = parser.parse_args()
     

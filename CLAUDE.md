@@ -22,6 +22,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     --resume results/checkpoint_*.pt --resume-optimizer sgd --resume-lr 0.01
   ```
 
+### Kolmogorov Regularization (Experimental)
+The codebase supports Kolmogorov complexity regularization via a secondary "weight predictor" network that learns to predict the main network's weights. This encourages simpler, more compressible weight configurations.
+
+**Basic Usage:**
+```bash
+python draw-poly-while-training.py --input centered_ring.png --shape "[10]*8" --epochs 100 \
+  --kolmogorov-shape "[5, 5]" --kolmogorov-weight 0.01
+```
+
+**Key Parameters:**
+- `--kolmogorov-shape`: Architecture of weight predictor network (e.g., `"[5, 5]"` for two hidden layers of 5 neurons)
+- `--kolmogorov-weight`: Regularization strength (default: 0.0, disabled)
+- `--kolmogorov-loss-type`: Loss function - `cross_entropy` (default), `mse`, `gaussian_nll`, or `laplacian_nll`
+- `--kolmogorov-bins`: Number of bins for cross-entropy quantization (default: 256)
+- `--kolmogorov-weight-min/max`: Weight range for quantization (default: -3.0 to 3.0)
+- `--kolmogorov-lr`: Learning rate for weight predictor (default: same as main network)
+
+**Loss Types Explained:**
+- `cross_entropy`: Quantizes weights into bins, measures encoding cost (most theoretically sound)
+- `mse`: Simple L2 regression (baseline)
+- `gaussian_nll`: Assumes Gaussian weight distribution
+- `laplacian_nll`: Assumes sparse/peaked weight distribution
+
+**Example with Cross-Entropy:**
+```bash
+python draw-poly-while-training.py --input rgb_ring.png --shape "[10]*8" --epochs 200 \
+  --kolmogorov-shape "[8, 8]" --kolmogorov-weight 0.05 \
+  --kolmogorov-loss-type cross_entropy --kolmogorov-bins 128
+```
+
 ## Logging Features
 - Timestamped logs with proper log levels (INFO, WARNING, ERROR, DEBUG)
 - Performance timing for visualization steps
