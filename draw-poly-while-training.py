@@ -244,10 +244,24 @@ def compute_kolmogorov_loss(weight_predictor, main_network, device, weight_range
         return F.mse_loss(predictions.squeeze(), actual_weights)
 
     elif loss_type == 'cross_entropy':
-        # Quantize actual weights into bins
-        weight_bins = quantize_weights(actual_weights, weight_predictor.num_bins, weight_range)
-        # predictions are log-probabilities (from LogSoftmax)
-        return F.nll_loss(predictions, weight_bins)
+        # For cross-entropy with continuous targets, we need a differentiable approach
+        # Option 1: Use soft targets (differentiable)
+        min_val, max_val = weight_range
+        clipped = torch.clamp(actual_weights, min_val, max_val)
+        normalized = (clipped - min_val) / (max_val - min_val)
+        # Continuous bin index (float, not long!)
+        continuous_bins = normalized * (weight_predictor.num_bins - 1)
+
+        # Create soft one-hot encoding using temperature-based softmax
+        # This is differentiable w.r.t. actual_weights
+        temperature = 0.1  # Lower = closer to hard assignment
+        bin_indices = torch.arange(weight_predictor.num_bins, device=actual_weights.device, dtype=torch.float32)
+        distances = -torch.abs(continuous_bins.unsqueeze(1) - bin_indices.unsqueeze(0)) / temperature
+        soft_targets = F.softmax(distances, dim=1)
+
+        # Compute cross-entropy with soft targets (differentiable!)
+        # predictions are log-probabilities, soft_targets are probabilities
+        return -(soft_targets * predictions).sum(dim=1).mean()
 
     elif loss_type == 'gaussian_nll':
         predicted_mean = predictions[:, 0]
@@ -522,7 +536,7 @@ def train_network(network, optimizer, train_data, val_data, epochs, batch_size, 
             total_task_loss += task_loss.item()
             num_batches += 1
 
-        avg_train_loss = total_loss / num_batches
+        avg_combined_loss = total_loss / num_batches  # This is what SGD actually minimizes
         avg_task_loss = total_task_loss / num_batches
         avg_kolmogorov_loss = total_kolmogorov_loss / num_batches if use_kolmogorov else 0.0
 
@@ -537,14 +551,14 @@ def train_network(network, optimizer, train_data, val_data, epochs, batch_size, 
 
         if debug:
             logger.debug(f"Epoch {epoch+1}/{epochs}")
-            logger.debug(f"Training Loss: {avg_train_loss:.6f}")
+            logger.debug(f"Combined Loss: {avg_combined_loss:.6f}")
             logger.debug(f"Task Loss: {avg_task_loss:.6f}")
             if use_kolmogorov:
                 logger.debug(f"Kolmogorov Loss: {avg_kolmogorov_loss:.6f}")
             logger.debug(f"Validation Loss: {val_loss:.6f}")
 
-    # Return the final loss values (including kolmogorov loss for logging)
-    return avg_task_loss, val_loss, avg_kolmogorov_loss if use_kolmogorov else 0.0
+    # Return all loss values for logging
+    return avg_task_loss, val_loss, avg_kolmogorov_loss if use_kolmogorov else 0.0, avg_combined_loss
 
 # Global variables to track constant outputs
 constant_activation_map = None
@@ -1007,8 +1021,6 @@ def save_checkpoint(network, optimizer, epoch, output_dir, network_shape_b64, ra
         'pytorch_rng_state': torch.get_rng_state(),
         'numpy_rng_state': np.random.get_state(),
         'python_rng_state': random.getstate(),
-        'loss_history': loss_history_data if loss_history_data is not None else [],
-        'network_param_history': network_param_history_data if network_param_history_data is not None else {},
         'network_shape_b64': network_shape_b64,
         'random_seed': random_seed,
         'args': {
@@ -1122,7 +1134,7 @@ def full_pipeline(
     input_path,
     is_video=False,
     train_size=5000,
-    val_size=1000,
+    val_size=None,  # Will default to batch_size if None
     layer_sizes=[10, 10, 10, 10, 10, 10, 10, 10],
     epochs=10,
     batch_size=1024,
@@ -1154,6 +1166,9 @@ def full_pipeline(
         height, width = img.shape
 
     # Step 2: Sample training and validation data
+    # Use batch_size as val_size if not specified for fair loss comparison
+    if val_size is None:
+        val_size = batch_size
     train_data, val_data = sample_data(data, train_size, val_size)
 
     # Handle checkpoint resumption
@@ -1236,11 +1251,10 @@ def full_pipeline(
                                          restore_rng=True, restore_optimizer=restore_optimizer)
         start_epoch = checkpoint_data['epoch'] + 1  # Resume from next epoch
 
-        # Restore loss history and network param history for stagnation detection
-        if 'loss_history' in checkpoint_data:
-            loss_history = checkpoint_data['loss_history']
-        if 'network_param_history' in checkpoint_data:
-            network_param_history = checkpoint_data['network_param_history']
+        # Reset loss history and network param history for stagnation detection
+        # (these are not saved in checkpoints to avoid unbounded growth)
+        loss_history = []
+        network_param_history = {}
 
         # Override optimizer if requested
         if args.resume_optimizer:
@@ -1264,9 +1278,9 @@ def full_pipeline(
     checkpoint_interval = args.checkpoint_interval if args and hasattr(args, 'checkpoint_interval') else None
 
     for epoch in range(start_epoch, epochs):
-        train_loss, val_loss, kolmogorov_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args, weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
+        train_loss, val_loss, kolmogorov_loss, combined_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args, weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
         if weight_predictor is not None and args.kolmogorov_weight > 0.0:
-            logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Kolmogorov Loss: {kolmogorov_loss:.6f}")
+            logger.info(f"Epoch {epoch + 1}/{epochs} - Combined Loss: {combined_loss:.6f} (Task: {train_loss:.6f} + λ·K: {args.kolmogorov_weight * kolmogorov_loss:.6f}), Val Loss: {val_loss:.6f}, K-Loss: {kolmogorov_loss:.6f}")
         else:
             logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
