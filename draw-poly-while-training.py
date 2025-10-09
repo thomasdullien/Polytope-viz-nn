@@ -1279,10 +1279,11 @@ def full_pipeline(
 
     for epoch in range(start_epoch, epochs):
         train_loss, val_loss, kolmogorov_loss, combined_loss = train_network(network, optimizer, train_data, val_data, epochs=1, batch_size=batch_size, learning_rate=learning_rate, output_dir=output_dir, network_shape_b64=network_shape_b64, random_seed=random_seed, network_shape_str=network_shape_str, debug=debug, args=args, weight_predictor=weight_predictor, weight_predictor_optimizer=weight_predictor_optimizer)
-        if weight_predictor is not None and args.kolmogorov_weight > 0.0:
-            logger.info(f"Epoch {epoch + 1}/{epochs} - Combined Loss: {combined_loss:.6f} (Task: {train_loss:.6f} + λ·K: {args.kolmogorov_weight * kolmogorov_loss:.6f}), Val Loss: {val_loss:.6f}, K-Loss: {kolmogorov_loss:.6f}")
-        else:
-            logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        # Calculate weighted Kolmogorov loss (0.0 if disabled)
+        weighted_k_loss = args.kolmogorov_weight * kolmogorov_loss if (weight_predictor is not None and args.kolmogorov_weight > 0.0) else 0.0
+
+        # Always show combined loss format with λ·K term
+        logger.info(f"Epoch {epoch + 1}/{epochs} - Combined Loss: {combined_loss:.6f} (Task: {train_loss:.6f} + λ·K: {weighted_k_loss:.6f}), Val Loss: {val_loss:.6f}")
 
         # Check optimization problems on every epoch
         network.eval()
@@ -1464,7 +1465,16 @@ def parse_arguments():
     # Set up logging with file if specified
     global logger
     if args.log_file:
-        logger = setup_logger(args.log_file)
+        # Add file handler to existing logger
+        try:
+            file_handler = logging.FileHandler(args.log_file)
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logger.info(f"Logging to file: {args.log_file}")
+        except Exception as e:
+            logger.error(f"Failed to set up file logging to {args.log_file}: {str(e)}")
         
     # Set debug level if requested
     if args.debug:
