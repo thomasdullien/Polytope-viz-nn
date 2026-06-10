@@ -120,7 +120,8 @@ def full_pipeline(input_path, task_config: TaskConfig, is_video=False, train_siz
         save_kernel_smoothed_image(train_data, (height, width), smoothed_image_path, input_path, sigma=getattr(args, 'smoothing_sigma', 3.0), logger=logger)
 
     final_activation = getattr(args, 'final_activation', None) if task_config.name == 'classifier' else None
-    network = PolytopeNet(input_dim, layer_sizes, output_dim=task_config.output_dim, final_activation=final_activation, debug=debug, logger=logger)
+    hidden_activation = getattr(args, 'activation', 'leaky_relu')
+    network = PolytopeNet(input_dim, layer_sizes, output_dim=task_config.output_dim, final_activation=final_activation, hidden_activation=hidden_activation, debug=debug, logger=logger)
     trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {trainable_params}")
     summary(network, input_size=(1024, input_dim))

@@ -76,9 +76,7 @@ def dump_network_weights(network, filename):
                 bias_vector = module.bias.detach().cpu().numpy()
                 f.write("\n  Bias vector:\n")
                 f.write("    " + " ".join(f"{x:.6f}" for x in bias_vector) + "\n\n")
-            elif isinstance(module, nn.LeakyReLU):
-                f.write(f"Layer {i} (LeakyReLU activation)\n\n")
-            elif isinstance(module, nn.ReLU):
-                f.write(f"Layer {i} (ReLU activation)\n\n")
+            elif isinstance(module, (nn.LeakyReLU, nn.ReLU)) or module.__class__.__name__ == 'ReLU2':
+                f.write(f"Layer {i} ({module.__class__.__name__} activation)\n\n")
             elif isinstance(module, nn.Sigmoid):
                 f.write(f"Layer {i} (Sigmoid activation)\n\n")

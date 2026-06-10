@@ -2,14 +2,20 @@ import torch
 import torch.nn as nn
 
 
+class ReLU2(nn.Module):
+    def forward(self, x):
+        return torch.relu(x).square()
+
+
 class PolytopeNet(nn.Module):
-    def __init__(self, input_dim: int, layer_sizes: list[int], output_dim: int = 1, final_activation: str | None = None, debug: bool = False, logger=None):
+    def __init__(self, input_dim: int, layer_sizes: list[int], output_dim: int = 1, final_activation: str | None = None, hidden_activation: str = 'leaky_relu', debug: bool = False, logger=None):
         super().__init__()
         layers = []
         self.activation_layers = []
         self.debug = debug
         self.logger = logger
         self.final_activation = final_activation
+        self.hidden_activation = hidden_activation
 
         rng_state = torch.get_rng_state()
         prev_dim = input_dim
@@ -19,9 +25,9 @@ class PolytopeNet(nn.Module):
             nn.init.constant_(linear_layer.bias, 0.1)
             layers.append(linear_layer)
 
-            leaky_relu_layer = nn.LeakyReLU(negative_slope=0.01)
-            layers.append(leaky_relu_layer)
-            self.activation_layers.append(leaky_relu_layer)
+            activation_layer = self._make_hidden_activation(hidden_activation)
+            layers.append(activation_layer)
+            self.activation_layers.append(activation_layer)
             self.register_buffer(f'hash_coeffs_{i}', torch.randint(1, 2**31 - 1, (size,), dtype=torch.int64))
             prev_dim = size
 
@@ -43,20 +49,31 @@ class PolytopeNet(nn.Module):
         self.network = nn.Sequential(*layers)
         torch.set_rng_state(rng_state)
 
+    @staticmethod
+    def _make_hidden_activation(name: str):
+        if name == 'leaky_relu':
+            return nn.LeakyReLU(negative_slope=0.01)
+        if name == 'relu':
+            return nn.ReLU()
+        if name == 'relu2':
+            return ReLU2()
+        raise ValueError(f'Unknown hidden activation: {name}')
+
     def forward(self, x):
         polytope_hash = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
         current = x
         layer_idx = 0
         for i, layer in enumerate(self.network):
+            pre_activation = current
             current = layer(current)
-            if isinstance(layer, nn.LeakyReLU) and layer_idx < len(self.activation_layers):
-                activation_pattern = current > 0
+            if layer_idx < len(self.activation_layers) and layer is self.activation_layers[layer_idx]:
+                activation_pattern = pre_activation > 0
                 hash_coeffs = getattr(self, f'hash_coeffs_{layer_idx}')
                 polytope_hash += (activation_pattern * hash_coeffs).sum(dim=1)
                 layer_idx += 1
                 if self.debug and self.logger:
-                    dead_neurons = (current == 0).float().mean().item()
-                    self.logger.debug(f"Layer {i//2} LeakyReLU: dead neurons = {dead_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
+                    inactive_neurons = (pre_activation <= 0).float().mean().item()
+                    self.logger.debug(f"Layer {i//2} {layer.__class__.__name__}: inactive neurons = {inactive_neurons:.2%}, range = [{current.min():.6f}, {current.max():.6f}]")
             elif self.debug and self.logger and isinstance(layer, nn.Linear):
                 self.logger.debug(f"Layer {i//2} Linear: range = [{current.min():.6f}, {current.max():.6f}]")
         return current, polytope_hash

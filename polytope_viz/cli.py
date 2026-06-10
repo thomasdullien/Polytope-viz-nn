@@ -18,6 +18,7 @@ def _add_common_arguments(parser):
     parser.add_argument('--learning-rate', '-l', type=float, default=0.001, help='Learning rate (default: 0.001)')
     parser.add_argument('--output-dir', '-o', default='results', help='Output directory for results (default: results)')
     parser.add_argument('--snapshot-dir', default='snapshots', help='Directory for epoch snapshots (default: snapshots)')
+    parser.add_argument('--activation', type=str, default='leaky_relu', choices=['leaky_relu', 'relu', 'relu2'], help='Hidden activation function (default: leaky_relu)')
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'muon', 'sgd', 'sgd_momentum', 'rmsprop'], help='Optimizer to use (default: adam)')
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum factor for SGD with momentum (default: 0.9)')
     parser.add_argument('--adam-eps', type=float, default=1e-8, help='Epsilon for Adam/AdamW denominator stability (default: 1e-8)')
@@ -52,7 +53,7 @@ def _add_common_arguments(parser):
 
 
 def _network_shape_b64(args, include_final_activation=False):
-    params = f"{args.shape}_{args.points}_{args.batch_size}_{args.learning_rate}_{args.optimizer}"
+    params = f"{args.shape}_{args.points}_{args.batch_size}_{args.learning_rate}_{args.optimizer}_{args.activation}"
     if include_final_activation:
         params += f"_{args.final_activation}"
     if args.optimizer == 'sgd_momentum':
@@ -67,6 +68,7 @@ def _run(args, task_config, network_shape_b64, logger):
     logger.info(f"Training epochs: {args.epochs}")
     logger.info(f"Points: {args.points}")
     logger.info(f"Optimizer: {args.optimizer}")
+    logger.info(f"Hidden activation: {args.activation}")
     logger.info(f"Learning rate: {args.learning_rate}")
     if args.optimizer in {'adam', 'adamw'} or args.resume_optimizer in {'adam', 'adamw'}:
         logger.info(f"Adam eps: {args.adam_eps}")
